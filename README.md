@@ -75,11 +75,11 @@ install is fast. Only one model is held in memory at a time.
 5. **Click Start:** Launches the web UI
 
 ## 📸 Screenshots
-!(screenshots/start.png)
+![start page](screenshots/start.png)
 
-!(screenshots/run.png)
+![generation](screenshots/run.png)
 
-!(screenshots/compare.png)
+![compare](screenshots/compare.png)
 
 ## 🚀 How to use
 
