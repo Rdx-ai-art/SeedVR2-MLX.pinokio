@@ -1,0 +1,7 @@
+{
+  "title": "SeedVR2-7B MLX",
+  "description": "One-step SeedVR2-7B diffusion super-resolution upscaler, running natively on Apple Silicon via MLX. Choose between fp16 / int8 / sharp model variants, tune scale, softness, and seed, and compare before/after with a slider.",
+  "icon": "icon.png",
+  "platform": ["darwin"],
+  "arch": ["arm64"]
+}

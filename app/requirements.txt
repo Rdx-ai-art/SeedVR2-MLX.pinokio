@@ -1,0 +1,30 @@
+# mflux is installed with --no-deps in install.js to skip torch/transformers/matplotlib.
+# This file lists only the dependencies the MLX code path actually needs.
+
+# MLX backend
+mlx>=0.32.0,<0.33.0
+
+# Core (mflux MLX modules need these)
+numpy>=2.0.1,<3.0
+pillow>=12.3.0
+safetensors>=0.4.4,<1.0
+opencv-python>=4.10.0,<5.0
+piexif>=1.1.3,<2.0
+filelock>=3.20.1
+tqdm>=4.66.5,<5.0
+requests>=2.33.0
+urllib3>=2.7.0
+platformdirs>=4.0,<5.0
+toml>=0.10.2,<1.0
+pyyaml>=6.0,<7.0
+protobuf>=4.25.0,<8.0
+regex>=2024.11.6
+fonttools>=4.60.2
+
+# Model downloads
+huggingface_hub[hf_xet]>=0.24.0
+
+# Web server
+fastapi>=0.115.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9

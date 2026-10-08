@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SeedVR2-7B MLX Image Upscaler</title>
+  <link rel="stylesheet" href="style.css?v=9">
+</head>
+<body>
+  <header id="hero">
+    <h1>✨ SeedVR2-7B <span class="accent">MLX</span> Image Upscaler</h1>
+    <p>One-step diffusion super-resolution · runs natively on Apple Silicon</p>
+  </header>
+
+  <main class="layout">
+    <!-- Left: controls -->
+    <aside class="panel controls">
+      <section class="group">
+        <h2>Model</h2>
+        <select id="model-select" class="input"></select>
+        <button id="load-btn" class="btn secondary">⬇️ Load / Switch Model</button>
+        <p id="model-status" class="status">Select a model, then click <b>Load Model</b>.</p>
+      </section>
+
+      <section class="group">
+        <h2>Memory Limiter</h2>
+        <div class="field">
+          <span>Metal limit<em id="ram-info">…</em></span>
+          <select id="mem-limit" class="input"></select>
+        </div>
+        <p id="mem-status" class="status"></p>
+        <small class="hint">Lower limit = less RAM used, but slower inference. The limit is approximate — peak usage can run higher according to image size and vae tile size. <b>Set it before loading the model</b>.</small>
+      </section>
+
+      <section class="group">
+        <h2>Input</h2>
+        <div id="dropzone" class="dropzone">
+          <input type="file" id="file-input" accept="image/*" style="display:none">
+          <div class="dropzone-inner" id="dropzone-hint">
+            <span class="dz-icon">🖼️</span>
+            <span>Drop an image or click to browse</span>
+          </div>
+          <img id="dropzone-preview" class="dz-preview" style="display:none">
+        </div>
+      </section>
+
+      <section class="group">
+        <h2>Settings</h2>
+        <div class="row">
+          <label class="field">
+            <span>Output size</span>
+            <select id="scale-mode" class="input">
+              <option value="factor" selected>Scale factor</option>
+              <option value="target">Target size</option>
+            </select>
+          </label>
+        </div>
+        <div class="row" id="factor-row">
+          <label class="field grow">
+            <span>Scale ×<em id="factor-val">2.0</em></span>
+            <input type="range" id="scale-factor" min="1" max="4" step="0.25" value="2">
+          </label>
+        </div>
+        <div class="row" id="target-row" style="display:none">
+          <label class="field grow">
+            <span>Shortest side<em id="target-val">2048 px</em></span>
+            <input type="range" id="target-px" min="512" max="8192" step="16" value="2048">
+          </label>
+          <input type="number" id="target-px-num" class="input narrow" min="64" max="16384" step="16" value="2048">
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>Softness<em id="soft-val">0.00</em></span>
+            <input type="range" id="softness" min="0" max="1" step="0.05" value="0">
+            <small class="hint">Pre-downsamples before upscaling. 0 = off, 0.5 = balanced, 1.0 = max smooth.</small>
+          </label>
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>Input noise<em id="noise-val">0.00</em></span>
+            <input type="range" id="input-noise" min="0" max="1" step="0.01" value="0">
+            <small class="hint">Adds controlled variation to the encoded latent. Can reduce certain artifacts. 0 = off.</small>
+          </label>
+        </div>
+        <div class="row">
+          <label class="field grow">
+            <span>Seed</span>
+            <input type="number" id="seed" class="input" min="0" max="999999" value="42">
+          </label>
+          <button id="rand-seed" class="btn icon" title="Random seed">🎲</button>
+        </div>
+      </section>
+
+      <section class="group collapsible">
+        <h2 class="collapse-toggle" onclick="toggleCollapse(this)">Advanced (tiling)</h2>
+        <div class="collapse-body" id="tiling-body">
+          <label class="check">
+            <input type="checkbox" id="use-tiling" checked> Use VAE tiling (encode + decode)
+          </label>
+          <label class="field">
+            <span>Tile size</span>
+            <select id="tile-size" class="input">
+              <option value="128">128</option>
+              <option value="256">256</option>
+              <option value="512" selected>512</option>
+              <option value="1024">1024</option>
+            </select>
+            <small class="hint">smaller = safer peak memory limit, but slower generation. 1024 significantly increases memory, while providing a modest speed boost.</small>
+          </label>
+          <label class="field grow">
+            <span>Overlap<em id="tile-ov-val">64</em></span>
+            <input type="range" id="tile-overlap" min="0" max="256" step="8" value="64">
+          </label>
+        </div>
+      </section>
+
+      <button id="upscale-btn" class="btn primary full" disabled>🚀 Upscale</button>
+    </aside>
+
+    <!-- Right: results -->
+    <section class="panel results">
+      <div id="result-status" class="status">👆 Upload an image and click <b>Upscale</b>.</div>
+
+      <div class="tabs" id="result-tabs" style="display:none">
+        <button type="button" onclick="switchTab('result')" class="tab active" data-tab="result">Result</button>
+        <button type="button" onclick="switchTab('compare')" class="tab" data-tab="compare">Compare</button>
+      </div>
+
+      <div id="tab-result" class="tab-content" style="display:none">
+        <img id="output-img" class="output-img" alt="Result">
+        <a id="download-link" class="btn secondary" download>⬇️ Download PNG</a>
+      </div>
+
+      <div id="tab-compare" class="tab-content" style="display:none">
+        <div class="zoom-bar">
+          <span class="zoom-label" id="zoom-level">100%</span>
+          <button type="button" class="btn icon" onclick="resetZoom()" title="Reset zoom">↺</button>
+        </div>
+        <p class="hint cmp-controls"><b>Controls</b> — Scroll = zoom · Drag = pan (when zoomed) · Click / drag the ⇔ handle = move slider · Double-click = reset</p>
+        <div id="comparison" class="comparison" style="display:none">
+          <div class="cmp-zoom-wrapper" id="cmp-zoom">
+            <img id="cmp-before" class="cmp-img" alt="Original">
+            <img id="cmp-after" class="cmp-img" alt="Upscaled">
+            <div class="cmp-handle" id="cmp-handle"><div class="cmp-knob" id="cmp-knob"></div></div>
+          </div>
+          <span class="cmp-tag tag-before">Upscaled</span>
+          <span class="cmp-tag tag-after">Original</span>
+          <input type="range" id="cmp-range" class="cmp-range" min="0" max="100" value="50">
+        </div>
+      </div>
+
+      <div id="progress" class="progress" style="display:none">
+        <div class="progress-bar" id="progress-fill"></div>
+        <span class="progress-label" id="progress-text">Processing…</span>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js?v=13"></script>
+</body>
+</html>

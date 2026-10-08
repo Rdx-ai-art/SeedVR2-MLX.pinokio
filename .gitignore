@@ -1,0 +1,22 @@
+# Python virtual environment
+app/env/
+**/__pycache__/
+*.pyc
+
+# Model weights — downloaded lazily on first use (do not commit ~9-16 GB of weights)
+app/models/
+
+# Generated upscale outputs
+app/outputs/
+
+# Uploads
+app/uploads
+
+# Cache
+cache/
+
+# Pinokio runtime logs
+logs/
+
+# Local tooling config (not part of the app)
+.qwen/
