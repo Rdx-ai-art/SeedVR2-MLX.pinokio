@@ -21,7 +21,4 @@ logs/
 # Local tooling config (not part of the app)
 .qwen/
 
-#screenshots folder
-screenshots/
-
 .DS_Store
