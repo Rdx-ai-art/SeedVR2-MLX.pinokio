@@ -8,12 +8,14 @@ Run:  python app.py --port 7860
 
 import argparse
 import asyncio
+import io
 import json
 import os
 import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 from queue import Queue
 from typing import Any, Callable, Optional
@@ -21,7 +23,7 @@ from typing import Any, Callable, Optional
 import huggingface_hub as hf
 import mlx.core as mx
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 
@@ -418,6 +420,59 @@ async def download(filename: str):
     if not path.exists():
         raise HTTPException(404, "File not found")
     return FileResponse(path, media_type="image/png", filename=filename)
+
+
+@app.post("/api/download_all")
+async def download_all(files: list = Body(..., embed=True)):
+    """Zip the given output filenames (from outputs/) into a single download.
+
+    Names are validated to live directly inside outputs/ (no path traversal).
+    """
+    base = OUTPUT_DIR.resolve()
+    buf = io.BytesIO()
+    count = 0
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name in files:
+            if not isinstance(name, str) or not name or "/" in name or "\\" in name or name in (".", ".."):
+                continue
+            path = (OUTPUT_DIR / name).resolve()
+            if path.parent != base or not path.is_file():
+                continue
+            zf.write(path, arcname=name)
+            count += 1
+    if count == 0:
+        raise HTTPException(404, "No files to download")
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": 'attachment; filename="seedvr2_results.zip"'},
+    )
+
+
+@app.get("/api/outputs")
+async def outputs_info():
+    """Total size + file count of the outputs folder (results + sidecar JSONs)."""
+    total = 0
+    count = 0
+    for f in OUTPUT_DIR.iterdir():
+        if f.is_file():
+            total += f.stat().st_size
+            count += 1
+    return {"size_bytes": total, "count": count}
+
+
+@app.post("/api/outputs/clear")
+async def outputs_clear():
+    """Delete every file in outputs/ (all sessions, not just the current one)."""
+    deleted = 0
+    freed = 0
+    for f in OUTPUT_DIR.iterdir():
+        if f.is_file():
+            freed += f.stat().st_size
+            f.unlink()
+            deleted += 1
+    return {"deleted": deleted, "freed_bytes": freed}
 
 
 # Static frontend (mounted last so /api/* routes take priority)

@@ -3,7 +3,7 @@ app/env/
 **/__pycache__/
 *.pyc
 
-# Model weights — downloaded lazily on first use (do not commit ~9-16 GB of weights)
+# Model weights — downloaded lazily on first use
 app/models/
 
 # Generated upscale outputs
@@ -20,5 +20,8 @@ logs/
 
 # Local tooling config (not part of the app)
 .qwen/
+
+#screenshots folder
+screenshots/
 
 .DS_Store

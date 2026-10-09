@@ -3,7 +3,9 @@
 const $ = (s) => document.querySelector(s);
 
 // --- State ---
-let uploadedFile = null;
+let uploadedFiles = [];  // [{ file, url }] — the batch queue
+let library = [];        // completed runs this session, newest first
+let batching = false;
 let modelLoaded = false;
 
 // --- Init ---
@@ -20,6 +22,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
   $("#load-btn").addEventListener("click", loadModel);
   $("#upscale-btn").addEventListener("click", doUpscale);
+  $("#download-all-btn").addEventListener("click", downloadAll);
+  $("#clear-outputs-btn").addEventListener("click", clearOutputs);
+  refreshOutputsSize();
   $("#rand-seed").addEventListener("click", () => {
     $("#seed").value = Math.floor(Math.random() * 1000000);
   });
@@ -92,14 +97,19 @@ async function loadModel() {
   }
 }
 
-// --- Dropzone ---
+// --- Dropzone (multi-file) ---
 function setupDropzone() {
   const dz = $("#dropzone");
   const input = $("#file-input");
 
-  dz.addEventListener("click", () => input.click());
+  dz.addEventListener("click", (e) => {
+    // Ignore clicks on the remove buttons.
+    if (e.target.closest(".dz-remove")) return;
+    input.click();
+  });
   input.addEventListener("change", () => {
-    if (input.files[0]) setFile(input.files[0]);
+    addFiles([...input.files]);
+    input.value = ""; // allow re-selecting the same file
   });
 
   dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dragover"); });
@@ -107,23 +117,50 @@ function setupDropzone() {
   dz.addEventListener("drop", (e) => {
     e.preventDefault();
     dz.classList.remove("dragover");
-    const file = e.dataTransfer.files[0];
-    if (file && file.type.startsWith("image/")) setFile(file);
+    addFiles([...e.dataTransfer.files].filter((f) => f.type.startsWith("image/")));
   });
 }
 
-function setFile(file) {
-  uploadedFile = file;
-  const preview = $("#dropzone-preview");
+// Global for inline onclick handlers.
+function removeFile(i) {
+  const item = uploadedFiles[i];
+  if (!item) return;
+  URL.revokeObjectURL(item.url);
+  uploadedFiles.splice(i, 1);
+  renderThumbs();
+}
+
+function addFiles(files) {
+  for (const f of files) {
+    if (!f.type.startsWith("image/")) continue;
+    // Skip duplicates (same name + size).
+    if (uploadedFiles.some((x) => x.file.name === f.name && x.file.size === f.size)) continue;
+    uploadedFiles.push({ file: f, url: URL.createObjectURL(f) });
+  }
+  renderThumbs();
+}
+
+function renderThumbs() {
+  const strip = $("#dropzone-thumbs");
   const hint = $("#dropzone-hint");
-  preview.src = URL.createObjectURL(file);
-  preview.style.display = "block";
-  hint.style.display = "none";
+  strip.innerHTML = uploadedFiles
+    .map(({ file, url }, i) => `
+      <div class="dz-thumb" title="${esc(file.name)}">
+        <img src="${url}" alt="">
+        <button type="button" class="dz-remove" onclick="removeFile(${i})" title="Remove">✕</button>
+      </div>`)
+    .join("");
+  const has = uploadedFiles.length > 0;
+  strip.style.display = has ? "flex" : "none";
+  hint.style.display = has ? "none" : "";
   updateUpscaleBtn();
 }
 
 function updateUpscaleBtn() {
-  $("#upscale-btn").disabled = !(uploadedFile && modelLoaded);
+  const n = uploadedFiles.length;
+  const btn = $("#upscale-btn");
+  btn.disabled = !(n && modelLoaded) || batching;
+  btn.textContent = n > 1 ? `🚀 Upscale (${n})` : "🚀 Upscale";
 }
 
 // --- Comparison slider + zoom (integrated) ---
@@ -393,24 +430,132 @@ function setupTargetSync() {
   });
 }
 
-// --- Upscale ---
+// --- Upscale (batch) ---
+// Runs every queued file through /api/upscale SEQUENTIALLY — the MLX worker
+// thread serializes GPU work anyway, so parallel requests would only pile up.
 async function doUpscale() {
-  if (!uploadedFile) return;
+  if (!uploadedFiles.length || batching) return;
 
-  const btn = $("#upscale-btn");
+  const items = [...uploadedFiles];
+  batching = true;
+  updateUpscaleBtn();
+
   const progress = $("#progress");
   const progressFill = $("#progress-fill");
   const progressText = $("#progress-text");
   const statusEl = $("#result-status");
 
-  btn.disabled = true;
-  progress.style.display = "flex";
-  progressFill.style.width = "30%";
-  progressText.textContent = "Uploading & processing…";
-  statusEl.textContent = "⏳ Working…";
+  // Snapshot the settings once, so every run in the batch is identical.
+  const cfg = {
+    scale: $("#scale-mode").value === "factor"
+      ? `${parseFloat($("#scale-factor").value)}×`
+      : `${$("#target-px-num").value || $("#target-px").value} px`,
+    model: ($("#model-select").selectedOptions[0]?.textContent || "").replace(" · recommended", ""),
+  };
 
+  progress.style.display = "flex";
+  progressFill.style.width = "0%";
+
+  // Dynamic fill: linear, driven by the best time estimate available —
+  // the previous run's actual elapsed, scaled by pixel count (inference
+  // time is deterministic per resolution/model/tiling). The fill is
+  // capped at 98% of the band until the response actually arrives, so a
+  // bad estimate can never make the bar look finished early.
+  let fillPct = 0;
+  let fillRaf = null;
+  let filling = false;
+  const startFill = (bandStart, bandEnd, estSeconds) => {
+    stopFill();
+    filling = true;
+    const t0 = performance.now();
+    const startPct = fillPct;
+    const capPct = bandStart + (bandEnd - bandStart) * 0.98;
+    const step = (now) => {
+      if (!filling) return;
+      const dt = (now - t0) / 1000;
+      const frac = Math.min(1, dt / estSeconds);
+      fillPct = Math.min(capPct, startPct + (bandEnd - startPct) * frac);
+      progressFill.style.width = fillPct + "%";
+      fillRaf = requestAnimationFrame(step);
+    };
+    fillRaf = requestAnimationFrame(step);
+  };
+  const stopFill = (snapPct) => {
+    filling = false;
+    if (fillRaf) cancelAnimationFrame(fillRaf);
+    if (snapPct != null) fillPct = snapPct;
+    progressFill.style.width = fillPct + "%";
+  };
+
+  // Input pixel count from the already-decoded dropzone thumbnail.
+  const itemPx = (i) => {
+    const el = $("#dropzone-thumbs").children[i]?.querySelector("img");
+    return el && el.naturalWidth ? el.naturalWidth * el.naturalHeight : 0;
+  };
+
+  let ok = 0, fail = 0, lastError = null, lastData = null;
+  let prevElapsed = null, prevInPx = 0;
+  const DEFAULT_EST = 90; // seconds, used for the first item only
+
+  for (let i = 0; i < items.length; i++) {
+    const f = items[i].file;
+    const bandStart = (i / items.length) * 100;
+    const bandEnd = ((i + 1) / items.length) * 100;
+    const px = itemPx(i) || prevInPx;
+    const est = prevElapsed
+      ? (px && prevInPx ? Math.min(600, Math.max(5, prevElapsed * (px / prevInPx))) : prevElapsed)
+      : DEFAULT_EST;
+    progressText.textContent = `Processing ${i + 1}/${items.length}: ${f.name}`;
+    statusEl.textContent = `⏳ ${i + 1}/${items.length} — ${f.name}`;
+    startFill(bandStart, bandEnd, est);
+    try {
+      const data = await upscaleOne(f);
+      ok++;
+      lastData = data;
+      prevElapsed = data.elapsed;
+      prevInPx = px;
+      library.unshift({ ...data, sourceName: f.name, scale: cfg.scale, model: cfg.model });
+      renderLibrary();
+      showResult(data);
+      // First result: surface the Result pane so progress is visible live.
+      if (ok === 1) switchTab("result");
+    } catch (e) {
+      fail++;
+      lastError = e;
+      statusEl.textContent = `⚠️ ${f.name} failed — ${e.message}`;
+    }
+    stopFill(bandEnd);
+  }
+
+  stopFill(100);
+  progressText.textContent = "Done!";
+  if (fail === 0) {
+    if (lastData) {
+      statusEl.textContent =
+        (items.length > 1 ? `✅ ${ok}/${items.length} done — ` : "✅ ") +
+        `${lastData.width}×${lastData.height} · ${lastData.elapsed}s → ${lastData.filename}` +
+        (items.length > 1 ? " · see Library" : "");
+    } else {
+      statusEl.textContent = `✅ Done`;
+    }
+    statusEl.className = "status ok";
+  } else {
+    statusEl.textContent = `⚠️ ${ok} done, ${fail} failed — ${lastError?.message || ""}`;
+    statusEl.className = "status";
+  }
+
+  // A batch is best reviewed in the Library; a single run shows its result.
+  switchTab(items.length > 1 ? "library" : "result");
+
+  batching = false;
+  updateUpscaleBtn();
+  setTimeout(() => { progress.style.display = "none"; progressFill.style.width = "0%"; }, 800);
+}
+
+// One file through the API. Throws on failure.
+async function upscaleOne(file) {
   const form = new FormData();
-  form.append("file", uploadedFile);
+  form.append("file", file);
   form.append("model", $("#model-select").value);
   form.append("scale_mode", $("#scale-mode").value);
   form.append("scale_factor", $("#scale-factor").value);
@@ -422,41 +567,169 @@ async function doUpscale() {
   form.append("tile_size", $("#tile-size").value);
   form.append("tile_overlap", $("#tile-overlap").value);
 
+  const res = await fetch("/api/upscale", { method: "POST", body: form });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail || "Upscale failed");
+  }
+  return res.json();
+}
+
+// Fill the Result + Compare views with a run's images.
+function showResult(data) {
+  $("#output-img").src = data.after_url;
+  $("#download-link").href = data.download_url;
+  $("#download-link").download = data.filename;
+
+  $("#cmp-before").src = data.before_url;
+  $("#cmp-after").src = data.after_url;
+  $("#cmp-range").value = 50;
+  $("#cmp-after").style.clipPath = "inset(0 50% 0 0)";
+  $("#cmp-handle").style.left = "50%";
+  resetZoom();
+
+  $("#result-tabs").style.display = "flex";
+}
+
+// --- Library (session-only: empty on load, fed by every completed run) ---
+function renderLibrary() {
+  const grid = $("#library-grid");
+  $("#library-empty").style.display = library.length ? "none" : "";
+  const countEl = $("#library-count");
+  const dlAll = $("#download-all-btn");
+  countEl.textContent = library.length
+    ? `${library.length} image${library.length > 1 ? "s" : ""} this session`
+    : "";
+  dlAll.disabled = !library.length || dlAll.dataset.busy === "1";
+  if (dlAll.dataset.busy !== "1") {
+    dlAll.textContent = library.length
+      ? `⬇️ Download all (${library.length})`
+      : "⬇️ Download all";
+  }
+  grid.innerHTML = library
+    .map((r, i) => `
+      <div class="lib-card" onclick="libraryCompare(${i})" title="Click to compare">
+        <img src="${r.after_url}" loading="lazy" alt="">
+        <div class="lib-meta">
+          <span class="lib-name">${esc(r.sourceName)}</span>
+          <span class="lib-sub">${r.width}×${r.height} · ${r.elapsed}s</span>
+          <span class="lib-sub">${esc(r.scale || "")} · ${esc(r.model || "")}</span>
+          <div class="lib-actions" onclick="event.stopPropagation()">
+            <button type="button" class="btn icon" onclick="libraryCompare(${i})" title="Compare">↔️</button>
+            <a class="btn icon" href="${r.download_url}" download="${esc(r.filename)}" title="Download">⬇️</a>
+          </div>
+        </div>
+      </div>`)
+    .join("");
+  refreshOutputsSize(); // keep the on-disk size current after each run/clear
+}
+
+// Global for inline onclick handlers.
+function libraryCompare(i) {
+  const r = library[i];
+  if (!r) return;
+  $("#cmp-before").src = r.before_url;
+  $("#cmp-after").src = r.after_url;
+  $("#cmp-range").value = 50;
+  $("#cmp-after").style.clipPath = "inset(0 50% 0 0)";
+  $("#cmp-handle").style.left = "50%";
+  resetZoom();
+  $("#output-img").src = r.after_url;
+  $("#download-link").href = r.download_url;
+  $("#download-link").download = r.filename;
+  switchTab("compare");
+}
+
+// Zip the whole session's results into one download (server-side).
+async function downloadAll() {
+  if (!library.length) return;
+  const btn = $("#download-all-btn");
+  const statusEl = $("#result-status");
+  const orig = btn.textContent;
+  btn.dataset.busy = "1";
+  btn.disabled = true;
+  btn.textContent = "⏳ Zipping…";
+
   try {
-    const res = await fetch("/api/upscale", { method: "POST", body: form });
+    const res = await fetch("/api/download_all", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ files: library.map((r) => r.filename) }),
+    });
     if (!res.ok) {
-      const err = await res.json().catch(() => ({ detail: res.statusText }));
-      throw new Error(err.detail || "Upscale failed");
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.detail || `HTTP ${res.status}`);
     }
-    const data = await res.json();
-
-    progressFill.style.width = "100%";
-    progressText.textContent = "Done!";
-
-    // Result tab: full-res output
-    $("#output-img").src = data.after_url;
-    $("#download-link").href = data.download_url;
-    $("#download-link").download = data.filename;
-
-    // Compare tab: both at output resolution (input upscaled to match)
-    $("#cmp-before").src = data.before_url;
-    $("#cmp-after").src = data.after_url;
-    $("#cmp-range").value = 50;
-    $("#cmp-after").style.clipPath = "inset(0 50% 0 0)";
-    $(".cmp-handle").style.left = "50%";
-    resetZoom();
-
-    // Show tabs
-    $("#result-tabs").style.display = "flex";
-    $("#tab-result").style.display = "";
-
-    statusEl.textContent = `✅ ${data.width}×${data.height} · ${data.elapsed}s → ${data.filename}`;
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = "seedvr2_results.zip";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 5000);
+    statusEl.textContent = `✅ Downloaded ${library.length} image${library.length > 1 ? "s" : ""} as seedvr2_results.zip`;
     statusEl.className = "status ok";
   } catch (e) {
-    statusEl.textContent = `❌ ${e.message}`;
+    statusEl.textContent = `❌ Download all failed — ${e.message}`;
     statusEl.className = "status";
   } finally {
+    delete btn.dataset.busy;
     btn.disabled = false;
-    setTimeout(() => { progress.style.display = "none"; progressFill.style.width = "0%"; }, 800);
+    btn.textContent = orig;
   }
+}
+
+// --- Outputs folder: size readout + full clear (all sessions) ---
+function fmtBytes(n) {
+  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(1) + " GB";
+  if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + " MB";
+  if (n >= 1024) return Math.round(n / 1024) + " KB";
+  return n + " B";
+}
+
+async function refreshOutputsSize() {
+  try {
+    const res = await fetch("/api/outputs");
+    if (!res.ok) return;
+    const data = await res.json();
+    $("#library-size").textContent = data.count
+      ? `· ≈ ${fmtBytes(data.size_bytes)} total in outputs folder.`
+      : "";
+    $("#clear-outputs-btn").disabled = data.count === 0;
+  } catch (e) { /* non-critical */ }
+}
+
+async function clearOutputs() {
+  const btn = $("#clear-outputs-btn");
+  const statusEl = $("#result-status");
+  if (!confirm(
+    "Delete ALL files in app/outputs/?\n\n" +
+    "This removes every saved result (from ALL sessions), not just this session's library."
+  )) return;
+
+  const orig = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = "⏳ Clearing…";
+  try {
+    const res = await fetch("/api/outputs/clear", { method: "POST" });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    library.length = 0;
+    renderLibrary();
+    statusEl.textContent = `🗑 Cleared ${data.deleted} files (${fmtBytes(data.freed_bytes)}) from outputs/`;
+    statusEl.className = "status ok";
+    refreshOutputsSize();
+  } catch (e) {
+    statusEl.textContent = `❌ Clear failed — ${e.message}`;
+    statusEl.className = "status";
+  } finally {
+    btn.textContent = orig;
+    refreshOutputsSize(); // re-enables the button if files remain
+  }
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 }

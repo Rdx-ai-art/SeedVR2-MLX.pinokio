@@ -29,6 +29,7 @@ low-resolution image it produces a sharp, high-resolution result in **one denois
 - Lets you switch between four model variants (see below)
 - Controls **Metal memory usage** — an auto limit derived from your RAM by default, or a manual cap you pick in the UI
 - Shows the result in an interactive **before/after slider** (drag, scroll to zoom, double-click to reset) and offers a PNG download
+- Library tab, for multiple/batch import generations viewing.
 - Saves every result to `app/outputs/` with a **sidecar `.json`** recording the full run (model, settings, tiling, memory limit, generation time)
 
 ### Model variants
@@ -80,6 +81,8 @@ install is fast. Only one model is held in memory at a time.
 ![generation](screenshots/run.png)
 
 ![compare](screenshots/compare.png)
+
+![library](screenshots/library.png)
 
 ## 🚀 How to use
 
@@ -165,6 +168,9 @@ Assume the server is running at `http://127.0.0.1:7860` (adjust the port).
 | `/api/memlimit` | POST | JSON: `{"gb": 12}` | `{"mem_limit_gb": 12}` |
 | `/api/upscale` | POST | multipart (below) | `filename`, `width`, `height`, `elapsed`, before/after/download URLs |
 | `/api/download/{filename}` | GET | — | the file (from `outputs/` or `uploads/`) |
+| `/api/download_all` | POST | JSON: `{"files": ["a.png", ...]}` | a `.zip` of the given `outputs/` files |
+| `/api/outputs` | GET | — | `size_bytes` + `count` of the outputs folder |
+| `/api/outputs/clear` | POST | — | deletes **all** `outputs/` files; returns `deleted` + `freed_bytes` |
 
 ### 🐍 Python
 
@@ -233,6 +239,12 @@ curl -s -X POST http://127.0.0.1:7860/api/upscale \
   -F "file=@input.png" -F "model=SeedVR2-7B-mlx-int8" \
   -F "scale_mode=factor" -F "scale_factor=2.0" -F "seed=42" \
   -F "use_tiling=true" -F "tile_size=512" -F "tile_overlap=64"
+
+# Download several outputs as one zip
+curl -s -X POST http://127.0.0.1:7860/api/download_all \
+  -H "Content-Type: application/json" \
+  -d '{"files": ["input_seedvr_s42_1.png", "input_seedvr_s42_2.png"]}' \
+  -o results.zip
 ```
 
 ## 📁 Project structure

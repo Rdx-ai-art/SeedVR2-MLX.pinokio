@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SeedVR2-7B MLX Image Upscaler</title>
-  <link rel="stylesheet" href="style.css?v=9">
+  <link rel="stylesheet" href="style.css?v=20">
 </head>
 <body>
   <header id="hero">
@@ -35,12 +35,12 @@
       <section class="group">
         <h2>Input</h2>
         <div id="dropzone" class="dropzone">
-          <input type="file" id="file-input" accept="image/*" style="display:none">
+          <input type="file" id="file-input" accept="image/*" multiple style="display:none">
           <div class="dropzone-inner" id="dropzone-hint">
             <span class="dz-icon">🖼️</span>
-            <span>Drop an image or click to browse</span>
+            <span>Drop images or click to browse</span>
           </div>
-          <img id="dropzone-preview" class="dz-preview" style="display:none">
+          <div id="dropzone-thumbs" class="dz-thumbs" style="display:none"></div>
         </div>
       </section>
 
@@ -87,7 +87,7 @@
             <span>Seed</span>
             <input type="number" id="seed" class="input" min="0" max="999999" value="42">
           </label>
-          <button id="rand-seed" class="btn icon" title="Random seed">🎲</button>
+	   <button id="rand-seed" class="btn icon" title="Random seed">🎲</button>
         </div>
       </section>
 
@@ -124,6 +124,7 @@
       <div class="tabs" id="result-tabs" style="display:none">
         <button type="button" onclick="switchTab('result')" class="tab active" data-tab="result">Result</button>
         <button type="button" onclick="switchTab('compare')" class="tab" data-tab="compare">Compare</button>
+        <button type="button" onclick="switchTab('library')" class="tab" data-tab="library">Library</button>
       </div>
 
       <div id="tab-result" class="tab-content" style="display:none">
@@ -149,6 +150,22 @@
         </div>
       </div>
 
+      <div id="tab-library" class="tab-content" style="display:none">
+        <div class="library-header">
+          <div class="library-info">
+            <span class="library-count" id="library-count"></span>
+            <span class="library-size" id="library-size">total outputs size</span>
+          </div>
+          <div class="library-header-actions">
+            <button type="button" id="download-all-btn" class="btn secondary" disabled>⬇️ Download all</button>
+            <button type="button" id="clear-outputs-btn" class="btn danger" disabled>🗑 Clear</button>
+          </div>
+        </div>
+        <small class="hint">⚠️ <b>Clear</b> deletes <b>all</b> files in app/outputs/ — every saved result from every session, not just this session's library.</small>
+        <div id="library-empty" class="library-empty">No images processed yet this session.</div>
+        <div id="library-grid" class="library-grid"></div>
+      </div>
+
       <div id="progress" class="progress" style="display:none">
         <div class="progress-bar" id="progress-fill"></div>
         <span class="progress-label" id="progress-text">Processing…</span>
@@ -156,6 +173,6 @@
     </section>
   </main>
 
-  <script src="app.js?v=13"></script>
+  <script src="app.js?v=21"></script>
 </body>
 </html>
