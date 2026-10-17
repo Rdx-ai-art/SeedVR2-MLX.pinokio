@@ -14,6 +14,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   setupDropzone();
   setupComparisonSlider();
   setupZoom();
+  setupResultZoom();
   setupCollapsibles();
   setupSliderLabels();
   setupTargetSync();
@@ -57,6 +58,7 @@ async function loadModels() {
     const res = await fetch("/api/models");
     const data = await res.json();
     const select = $("#model-select");
+    const prev = select.value;
     select.innerHTML = "";
     for (const m of data.models) {
       const opt = document.createElement("option");
@@ -64,11 +66,60 @@ async function loadModels() {
       opt.textContent = m.label + (m.downloaded ? "" : " (not downloaded)") + (m.loaded ? " ✓" : "");
       select.appendChild(opt);
     }
+    // Preserve the user's selection (the options list was just rebuilt).
+    if (prev && [...select.options].some((o) => o.value === prev)) select.value = prev;
     modelLoaded = data.status === "ready";
     updateUpscaleBtn();
   } catch (e) {
     console.error("Failed to load models:", e);
   }
+}
+
+// --- Model download / load progress (polled from the server) ---
+// Mirrors the same download the terminal shows; the server gets its numbers
+// from huggingface_hub's own progress bars.
+let modelProgressTimer = null;
+
+function stopModelProgress() {
+  if (modelProgressTimer) { clearInterval(modelProgressTimer); modelProgressTimer = null; }
+  const bar = $("#model-progress");
+  if (bar) bar.style.display = "none";
+}
+
+function renderModelProgress(p) {
+  const bar = $("#model-progress");
+  const fill = $("#model-progress-fill");
+  const text = $("#model-progress-text");
+  if (!bar || !fill || !text) return;
+  if (p.phase === "download") {
+    bar.classList.remove("indeterminate");
+    if (p.bytes_total > 0) {
+      fill.style.width = Math.min(100, (p.bytes_done / p.bytes_total) * 100).toFixed(1) + "%";
+      text.textContent = `⬇️ ${fmtBytes(p.bytes_done)} / ${fmtBytes(p.bytes_total)} · ${p.files_done}/${p.files_total} files`;
+    } else {
+      fill.style.width = "0%";
+      text.textContent = `⬇️ ${fmtBytes(p.bytes_done)} · ${p.files_done}/${p.files_total} files`;
+    }
+  } else if (p.phase === "load" || p.phase === "unknown") {
+    bar.classList.add("indeterminate");
+    fill.style.width = "100%";
+    text.textContent = p.phase === "load" ? "⏳ Loading model weights…" : "⬇️ Downloading / loading…";
+  } else {
+    stopModelProgress();
+  }
+}
+
+async function pollModelProgress() {
+  try {
+    const res = await fetch("/api/models/progress");
+    if (res.ok) {
+      renderModelProgress(await res.json());
+    } else if (res.status === 404) {
+      // Server predates the progress endpoint — keep a live-looking bar
+      // (indeterminate) instead of a frozen one.
+      renderModelProgress({ phase: "unknown" });
+    }
+  } catch (e) { /* transient — keep polling */ }
 }
 
 async function loadModel() {
@@ -79,6 +130,11 @@ async function loadModel() {
   $("#load-btn").disabled = true;
   $("#upscale-btn").disabled = true;
 
+  // Live progress bar while the model downloads / loads.
+  $("#model-progress").style.display = "flex";
+  pollModelProgress();
+  modelProgressTimer = setInterval(pollModelProgress, 1000);
+
   try {
     const form = new FormData();
     form.append("slug", slug);
@@ -88,10 +144,12 @@ async function loadModel() {
     statusEl.textContent = `✅ Model ready: ${data.label}`;
     statusEl.className = "status ok";
     modelLoaded = true;
+    await loadModels(); // refresh the ✓ checkmark + downloaded state
   } catch (e) {
     statusEl.textContent = `❌ ${e.message}`;
     statusEl.className = "status";
   } finally {
+    stopModelProgress();
     $("#load-btn").disabled = false;
     updateUpscaleBtn();
   }
@@ -146,14 +204,42 @@ function renderThumbs() {
   strip.innerHTML = uploadedFiles
     .map(({ file, url }, i) => `
       <div class="dz-thumb" title="${esc(file.name)}">
-        <img src="${url}" alt="">
+        <img src="${url}" alt="" onload="thumbDims(this)">
+        <span class="dz-dims"></span>
         <button type="button" class="dz-remove" onclick="removeFile(${i})" title="Remove">✕</button>
       </div>`)
     .join("");
   const has = uploadedFiles.length > 0;
   strip.style.display = has ? "flex" : "none";
   hint.style.display = has ? "none" : "";
+  updateInputInfo();
   updateUpscaleBtn();
+}
+
+// Global for the inline onload handlers — caption each thumbnail with its
+// true pixel dimensions once it has decoded.
+function thumbDims(img) {
+  if (!img.naturalWidth) return;
+  const cap = img.parentElement && img.parentElement.querySelector(".dz-dims");
+  if (cap) cap.textContent = `${img.naturalWidth}×${img.naturalHeight}`;
+  updateInputInfo();
+}
+
+// One line under the dropzone: the input image size (single image) or the
+// batch total (multiple).
+function updateInputInfo() {
+  const el = $("#input-info");
+  if (!el) return;
+  if (!uploadedFiles.length) { el.style.display = "none"; return; }
+  if (uploadedFiles.length === 1) {
+    const img = $("#dropzone-thumbs") && $("#dropzone-thumbs").querySelector("img");
+    const dims = img && img.naturalWidth ? `${img.naturalWidth}×${img.naturalHeight} px` : "…";
+    el.textContent = `Input: ${dims} · ${fmtBytes(uploadedFiles[0].file.size)}`;
+  } else {
+    const total = uploadedFiles.reduce((a, x) => a + x.file.size, 0);
+    el.textContent = `${uploadedFiles.length} images · ${fmtBytes(total)}`;
+  }
+  el.style.display = "";
 }
 
 function updateUpscaleBtn() {
@@ -163,15 +249,72 @@ function updateUpscaleBtn() {
   btn.textContent = n > 1 ? `🚀 Upscale (${n})` : "🚀 Upscale";
 }
 
+// --- Zoom/pan controller (shared by the Compare and Result tabs) ---
+// `wrapper` is the element that receives the scale/pan transform; `rectEl`
+// is a stable, untransformed element whose layout box defines the viewport.
+// The transform is `scale(s) translate(pan)` about the viewport center, so
+// a screen delta maps to a pan delta divided by s, and zooming about a
+// cursor point keeps the image point under it fixed.
+function makeZoom(wrapper, rectEl, onApply) {
+  const st = { level: 1, x: 0, y: 0 };
+
+  function clamp() {
+    const rect = rectEl.getBoundingClientRect();
+    if (!rect || rect.width === 0) return;
+    // At zoom s the image extends (1 - 1/s)·w/2 px past each edge — the
+    // pan can move at most that far before a gap would show.
+    const mx = ((1 - 1 / st.level) * rect.width) / 2;
+    const my = ((1 - 1 / st.level) * rect.height) / 2;
+    st.x = Math.max(-mx, Math.min(mx, st.x));
+    st.y = Math.max(-my, Math.min(my, st.y));
+  }
+
+  function apply() {
+    const s = st.level;
+    wrapper.style.transform = s === 1 ? "" : `scale(${s}) translate(${st.x}px, ${st.y}px)`;
+    if (onApply) onApply(s);
+  }
+
+  return {
+    get level() { return st.level; },
+    get panX() { return st.x; },
+    get panY() { return st.y; },
+    reset() { st.level = 1; st.x = 0; st.y = 0; apply(); },
+    apply,
+    zoomAt(clientX, clientY, delta) {
+      const rect = rectEl.getBoundingClientRect();
+      if (!rect || rect.width === 0) return;
+      const s = st.level;
+      const s2 = Math.max(1, Math.min(8, s + delta));
+      if (s2 === s) return;
+      const cx = clientX - rect.left, cy = clientY - rect.top;
+      const ox = rect.width / 2, oy = rect.height / 2;
+      const ux = (cx + (s - 1) * ox) / s;
+      const uy = (cy + (s - 1) * oy) / s;
+      st.x = (cx + (s2 - 1) * ox) / s2 - (ux - st.x);
+      st.y = (cy + (s2 - 1) * oy) / s2 - (uy - st.y);
+      st.level = s2;
+      if (st.level === 1) { st.x = 0; st.y = 0; }
+      clamp();
+      apply();
+    },
+    panBy(dx, dy) {
+      st.x += dx / st.level;
+      st.y += dy / st.level;
+      clamp();
+      apply();
+    },
+  };
+}
+
 // --- Comparison slider + zoom (integrated) ---
 // The handle lives inside #cmp-zoom, which is the element that gets the zoom
 // transform, so the clip edge, handle line, and images always stay aligned.
 // Not zoomed: dragging anywhere moves the slider.
 // Zoomed: dragging the image pans, dragging the ⇔ handle moves the slider,
 // a plain click places the slider.
-let zoomLevel = 1;
-let zoomPanX = 0;
-let zoomPanY = 0;
+let cmpZoom = null;
+let resZoom = null;
 let sliderDragging = false;
 let panDragging = false;
 let panLastX = 0;
@@ -184,40 +327,21 @@ function cmpRect() {
   return cmp ? cmp.getBoundingClientRect() : null;
 }
 
-function clampPan() {
-  const rect = cmpRect();
-  if (!rect || rect.width === 0) return;
-  const mx = ((1 - 1 / zoomLevel) * rect.width) / 2;
-  const my = ((1 - 1 / zoomLevel) * rect.height) / 2;
-  zoomPanX = Math.max(-mx, Math.min(mx, zoomPanX));
-  zoomPanY = Math.max(-my, Math.min(my, zoomPanY));
-}
-
 function applyZoom() {
-  const wrapper = $("#cmp-zoom");
-  const knob = $("#cmp-knob");
-  if (!wrapper) return;
-  const s = zoomLevel;
-  wrapper.style.transform = s === 1 ? "" : `scale(${s}) translate(${zoomPanX}px, ${zoomPanY}px)`;
-  // Counter-scale the knob so it stays a constant size on screen.
-  if (knob) knob.style.transform = `translate(-50%, -50%) scale(${1 / s})`;
-  $("#zoom-level").textContent = `${Math.round(s * 100)}%`;
+  if (cmpZoom) cmpZoom.apply();
 }
 
 function resetZoom() {
-  zoomLevel = 1;
-  zoomPanX = 0;
-  zoomPanY = 0;
-  applyZoom();
+  if (cmpZoom) cmpZoom.reset();
 }
 
 // Map a cursor screen-X back through the zoom/pan transform into image space.
 function setSliderFromClientX(clientX) {
+  if (!cmpZoom) return;
   const rect = cmpRect();
   if (!rect || rect.width === 0) return;
-  const s = zoomLevel;
-  const ox = rect.width / 2;
-  const px = (clientX - rect.left + (s - 1) * ox) / s - zoomPanX;
+  const s = cmpZoom.level;
+  const px = (clientX - rect.left + (s - 1) * (rect.width / 2)) / s - cmpZoom.panX;
   const v = Math.max(0, Math.min(100, (px / rect.width) * 100));
   $("#cmp-range").value = v;
   $("#cmp-after").style.clipPath = `inset(0 ${100 - v}% 0 0)`;
@@ -225,17 +349,15 @@ function setSliderFromClientX(clientX) {
 }
 
 function panTo(clientX, clientY) {
-  zoomPanX += (clientX - panLastX) / zoomLevel;
-  zoomPanY += (clientY - panLastY) / zoomLevel;
+  if (!cmpZoom) return;
+  cmpZoom.panBy(clientX - panLastX, clientY - panLastY);
   panLastX = clientX;
   panLastY = clientY;
-  clampPan();
-  applyZoom();
 }
 
 function beginDrag(clientX, clientY, target) {
   const onKnob = target && target.closest && target.closest(".cmp-handle");
-  if (onKnob || zoomLevel <= 1) {
+  if (onKnob || !cmpZoom || cmpZoom.level <= 1) {
     sliderDragging = true;
     setSliderFromClientX(clientX);
   } else {
@@ -246,7 +368,7 @@ function beginDrag(clientX, clientY, target) {
 }
 
 function endDrag(clientX, clientY) {
-  if (panDragging && zoomLevel > 1) {
+  if (panDragging && cmpZoom && cmpZoom.level > 1) {
     // A plain click (no drag) places the slider under the cursor.
     if (Math.hypot(clientX - panStartX, clientY - panStartY) < 5) {
       setSliderFromClientX(clientX);
@@ -288,29 +410,74 @@ function setupZoom() {
   const cmp = $("#comparison");
   if (!cmp) return;
 
+  cmpZoom = makeZoom($("#cmp-zoom"), cmp, (s) => {
+    // Counter-scale the knob so it stays a constant size on screen.
+    const knob = $("#cmp-knob");
+    if (knob) knob.style.transform = `translate(-50%, -50%) scale(${1 / s})`;
+    $("#zoom-level").textContent = `${Math.round(s * 100)}%`;
+  });
+
+  // Wheel zoom (centered on the cursor) + double-click to reset.
   cmp.addEventListener("wheel", (e) => {
     e.preventDefault();
-    const rect = cmpRect();
-    if (!rect || rect.width === 0) return;
-    const s = zoomLevel;
-    const s2 = Math.max(1, Math.min(8, s + (e.deltaY > 0 ? -0.25 : 0.25)));
-    if (s2 === s) return;
-    // Keep the image point under the cursor fixed while zooming.
-    const cx = e.clientX - rect.left;
-    const cy = e.clientY - rect.top;
-    const ox = rect.width / 2;
-    const oy = rect.height / 2;
-    const ux = (cx + (s - 1) * ox) / s;
-    const uy = (cy + (s - 1) * oy) / s;
-    zoomPanX = (cx + (s2 - 1) * ox) / s2 - (ux - zoomPanX);
-    zoomPanY = (cy + (s2 - 1) * oy) / s2 - (uy - zoomPanY);
-    zoomLevel = s2;
-    if (zoomLevel === 1) { zoomPanX = 0; zoomPanY = 0; }
-    clampPan();
-    applyZoom();
+    cmpZoom.zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? -0.25 : 0.25);
   }, { passive: false });
+  cmp.addEventListener("dblclick", () => cmpZoom.reset());
+}
 
-  cmp.addEventListener("dblclick", () => resetZoom());
+// --- Result tab zoom (same controller as Compare) ---
+function setupResultZoom() {
+  const clip = $("#result-zoom-clip");
+  if (!clip) return;
+
+  resZoom = makeZoom($("#result-zoom"), clip, (s) => {
+    $("#res-zoom-level").textContent = `${Math.round(s * 100)}%`;
+  });
+
+  clip.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    resZoom.zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? -0.25 : 0.25);
+  }, { passive: false });
+  clip.addEventListener("dblclick", () => resZoom.reset());
+
+  // Drag to pan when zoomed (mouse + touch).
+  let dragging = false, lastX = 0, lastY = 0;
+  clip.addEventListener("mousedown", (e) => {
+    if (resZoom.level <= 1) return;
+    e.preventDefault();
+    dragging = true;
+    lastX = e.clientX;
+    lastY = e.clientY;
+    clip.classList.add("dragging");
+  });
+  window.addEventListener("mousemove", (e) => {
+    if (!dragging) return;
+    resZoom.panBy(e.clientX - lastX, e.clientY - lastY);
+    lastX = e.clientX;
+    lastY = e.clientY;
+  });
+  window.addEventListener("mouseup", () => {
+    dragging = false;
+    clip.classList.remove("dragging");
+  });
+  clip.addEventListener("touchstart", (e) => {
+    if (resZoom.level <= 1 || e.touches.length !== 1) return;
+    dragging = true;
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  }, { passive: true });
+  window.addEventListener("touchmove", (e) => {
+    if (!dragging || e.touches.length !== 1) return;
+    resZoom.panBy(e.touches[0].clientX - lastX, e.touches[0].clientY - lastY);
+    lastX = e.touches[0].clientX;
+    lastY = e.touches[0].clientY;
+  }, { passive: true });
+  window.addEventListener("touchend", () => { dragging = false; });
+}
+
+// Global for the inline onclick handler in the result zoom bar.
+function resetResultZoom() {
+  if (resZoom) resZoom.reset();
 }
 
 // --- Collapsibles (global, for inline onclick) ---
@@ -531,9 +698,12 @@ async function doUpscale() {
   progressText.textContent = "Done!";
   if (fail === 0) {
     if (lastData) {
+      const dims = lastData.in_width
+        ? `${lastData.in_width}×${lastData.in_height} → ${lastData.width}×${lastData.height} · `
+        : "";
       statusEl.textContent =
         (items.length > 1 ? `✅ ${ok}/${items.length} done — ` : "✅ ") +
-        `${lastData.width}×${lastData.height} · ${lastData.elapsed}s → ${lastData.filename}` +
+        `${dims}${lastData.width}×${lastData.height} · ${lastData.elapsed}s → ${lastData.filename}` +
         (items.length > 1 ? " · see Library" : "");
     } else {
       statusEl.textContent = `✅ Done`;
@@ -587,6 +757,7 @@ function showResult(data) {
   $("#cmp-after").style.clipPath = "inset(0 50% 0 0)";
   $("#cmp-handle").style.left = "50%";
   resetZoom();
+  resetResultZoom();
 
   $("#result-tabs").style.display = "flex";
 }
@@ -634,6 +805,7 @@ function libraryCompare(i) {
   $("#cmp-after").style.clipPath = "inset(0 50% 0 0)";
   $("#cmp-handle").style.left = "50%";
   resetZoom();
+  resetResultZoom();
   $("#output-img").src = r.after_url;
   $("#download-link").href = r.download_url;
   $("#download-link").download = r.filename;

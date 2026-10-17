@@ -208,7 +208,8 @@ input[type="range"]:hover::-moz-range-thumb {
 .dropzone {
   border: 1.5px dashed rgba(255, 255, 255, 0.16);
   border-radius: var(--radius);
-  padding: 24px;
+  padding: 28px;
+  min-height: 132px;
   text-align: center;
   cursor: pointer;
   background: rgba(255, 255, 255, 0.03);
@@ -226,12 +227,21 @@ input[type="range"]:hover::-moz-range-thumb {
 .dz-thumbs { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
 .dz-thumb {
   position: relative;
-  width: 56px; height: 56px;
-  border-radius: 8px;
+  width: 84px; height: 84px;
+  border-radius: 10px;
   overflow: hidden;
   border: 1px solid var(--border-strong);
 }
 .dz-thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.dz-dims {
+  position: absolute; left: 0; right: 0; bottom: 0;
+  padding: 1px 3px;
+  font-size: 9px; line-height: 1.3;
+  text-align: center;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.65);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
 .dz-remove {
   position: absolute; top: 2px; right: 2px;
   width: 18px; height: 18px;
@@ -331,13 +341,25 @@ input[type="range"]:hover::-moz-range-thumb {
 .tag-before { left: 10px; background: rgba(255, 255, 255, 0.14); color: #eee; }
 .tag-after { right: 10px; background: rgba(99, 102, 241, 0.5); color: #fff; }
 
-/* Output image */
+/* Output image — sits inside a clipping viewport for zoom/pan (Result tab) */
 .output-img {
   width: 100%;
   border-radius: var(--radius);
   display: block;
   border: 1px solid var(--border);
 }
+.zoom-clip {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  border-radius: var(--radius);
+  border: 1px solid var(--border);
+  background: #000;
+  user-select: none;
+  cursor: grab;
+}
+.zoom-clip:active, .zoom-clip.dragging { cursor: grabbing; }
+.zoom-clip-inner { position: relative; width: 100%; will-change: transform; }
 
 /* Library */
 .library-header {
@@ -434,3 +456,11 @@ input[type="range"]:hover::-moz-range-thumb {
   width: 0%;
 }
 .progress-label { position: relative; z-index: 1; font-size: 0.82rem; }
+.progress.indeterminate .progress-bar {
+  width: 100% !important;
+  animation: progress-pulse 1.2s ease-in-out infinite;
+}
+@keyframes progress-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 0.7; }
+}

@@ -26,6 +26,7 @@ from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
+from tqdm import tqdm
 
 # mflux's __init__.py chain eagerly imports torch, transformers, etc. (for its
 # PyTorch backend). We only use the MLX path, so inject permissive stubs for all
@@ -165,6 +166,50 @@ _model_lock = threading.Lock()
 _model_state: dict[str, Any] = {"ref": None, "slug": None, "status": "unloaded"}
 _output_counter = 0
 
+# --------------------------------------------------------------------------- #
+# Model download progress (mirrored from huggingface_hub's tqdm bars)
+# --------------------------------------------------------------------------- #
+# hf.snapshot_download(tqdm_class=_HFTqdm) instantiates _HFTqdm for its
+# aggregate bars: "Reconstructing …" (bytes written to disk) and
+# "Fetching N files" (files finished). We mirror those counters into
+# _download_progress, which the UI polls via /api/models/progress to render
+# a live download bar. Terminal rendering is unchanged: _HFTqdm is a plain
+# tqdm subclass that forwards every call to tqdm.
+_download_lock = threading.Lock()
+_download_progress: dict[str, Any] = {
+    "phase": None,        # None | "download" | "load"
+    "slug": None,
+    "bytes_done": 0,
+    "bytes_total": 0,
+    "files_done": 0,
+    "files_total": 0,
+}
+
+
+def _mirror_bar(bar: "tqdm") -> None:
+    """Copy a huggingface_hub progress bar's counters into _download_progress."""
+    with _download_lock:
+        desc = bar.desc or ""
+        if desc.startswith("Reconstructing"):
+            _download_progress["bytes_done"] = int(bar.n)
+            _download_progress["bytes_total"] = int(bar.total or 0)
+        elif desc.startswith("Fetching"):
+            _download_progress["files_done"] = int(bar.n)
+            _download_progress["files_total"] = int(bar.total or 0)
+
+
+class _HFTqdm(tqdm):
+    """tqdm subclass passed to hf.snapshot_download so the UI can poll progress."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        _mirror_bar(self)
+
+    def update(self, n: Any = 1) -> Any:
+        ret = super().update(n)
+        _mirror_bar(self)
+        return ret
+
 
 def model_is_downloaded(slug: str) -> bool:
     d = MODELS_DIR / slug
@@ -213,6 +258,17 @@ async def list_models():
     return {"models": models, "current": _model_state["slug"], "status": _model_state["status"]}
 
 
+@app.get("/api/models/progress")
+async def model_download_progress():
+    """Live model download/load progress, polled by the UI for its progress bar.
+
+    phase: None (idle) | "download" (bytes/files counters advancing) |
+    "load" (weights -> MLX, indeterminate).
+    """
+    with _download_lock:
+        return dict(_download_progress)
+
+
 @app.post("/api/models/load")
 async def load_model(slug: str = Form(...)):
     """Download (if needed) then load a model.
@@ -234,36 +290,59 @@ async def load_model(slug: str = Form(...)):
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, mx.clear_cache)
 
-        # Download (I/O bound — run in executor, NOT on the MLX thread).
-        d = MODELS_DIR / slug
-        if not model_is_downloaded(slug):
-            d.mkdir(parents=True, exist_ok=True)
+        try:
+            # Download (I/O bound — run in executor, NOT on the MLX thread).
+            d = MODELS_DIR / slug
+            if not model_is_downloaded(slug):
+                with _download_lock:
+                    _download_progress.update({
+                        "phase": "download", "slug": slug,
+                        "bytes_done": 0, "bytes_total": 0,
+                        "files_done": 0, "files_total": 0,
+                    })
+                d.mkdir(parents=True, exist_ok=True)
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: hf.snapshot_download(
+                        MODELS[slug]["repo"], local_dir=str(d),
+                        ignore_patterns=["*.md"],
+                        tqdm_class=_HFTqdm,  # type: ignore[arg-type]
+                    ),
+                )
+                with _download_lock:
+                    # Download finished — snap the byte counter to the total.
+                    _download_progress["bytes_done"] = _download_progress["bytes_total"]
+
+            # Loading the weights into MLX (indeterminate phase for the UI).
+            with _download_lock:
+                _download_progress["phase"] = "load"
+                _download_progress["slug"] = slug
+
+            # Load model on the dedicated MLX thread (it respects the active
+            # memory limit, so set the limit BEFORE loading for a clean state).
+            def _do_load():
+                # In auto mode, re-derive the limit for THIS model's precision
+                # (fp16 needs a 16 GB floor; int8 can go to 10 GB).
+                if _mem_limit["mode"] == "auto":
+                    limit = _auto_mem_limit_gb(slug)
+                    mx.set_memory_limit(limit * 1024**3)
+                    _mem_limit["gb"] = limit
+                    print(f"Metal memory limit (auto, {slug}): {limit} GB")
+                return SeedVR2MLX(str(d))
+
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(
-                None,
-                lambda: hf.snapshot_download(
-                    MODELS[slug]["repo"], local_dir=str(d), ignore_patterns=["*.md"]
-                ),
-            )
+            inst = await loop.run_in_executor(None, lambda: mlx_run(_do_load))
 
-        # Load model on the dedicated MLX thread (it respects the active
-        # memory limit, so set the limit BEFORE loading for a clean state).
-        def _do_load():
-            # In auto mode, re-derive the limit for THIS model's precision
-            # (fp16 needs a 16 GB floor; int8 can go to 10 GB).
-            if _mem_limit["mode"] == "auto":
-                limit = _auto_mem_limit_gb(slug)
-                mx.set_memory_limit(limit * 1024**3)
-                _mem_limit["gb"] = limit
-                print(f"Metal memory limit (auto, {slug}): {limit} GB")
-            return SeedVR2MLX(str(d))
-
-        loop = asyncio.get_event_loop()
-        inst = await loop.run_in_executor(None, lambda: mlx_run(_do_load))
-
-        _model_state["ref"] = inst
-        _model_state["slug"] = slug
-        _model_state["status"] = "ready"
+            _model_state["ref"] = inst
+            _model_state["slug"] = slug
+            _model_state["status"] = "ready"
+        finally:
+            # Reset the progress state no matter how the load ended, so the UI
+            # doesn't get stuck on a stale download/load indicator.
+            with _download_lock:
+                _download_progress["phase"] = None
+                _download_progress["slug"] = None
 
     return {"status": "ready", "label": MODELS[slug]["label"]}
 
@@ -325,6 +404,10 @@ async def upscale(
     content = await file.read()
     upload_path.write_bytes(content)
 
+    # Input dimensions (for the UI status line + output sidecar metadata).
+    with Image.open(upload_path) as im:
+        in_width, in_height = im.size
+
     try:
         # Determine resolution.
         if scale_mode == "target":
@@ -380,6 +463,7 @@ async def upscale(
                 "repo": MODELS[model]["repo"],
             },
             "resolution": {"width": after.width, "height": after.height},
+            "input": {"width": in_width, "height": in_height},
             "settings": {
                 "scale": str(resolution),
                 "softness": float(softness),
@@ -402,6 +486,8 @@ async def upscale(
             "filename": out_path.name,
             "width": after.width,
             "height": after.height,
+            "in_width": in_width,
+            "in_height": in_height,
             "elapsed": round(elapsed, 1),
             "before_url": f"/api/download/{before_name}",
             "after_url": f"/api/download/{out_path.name}",

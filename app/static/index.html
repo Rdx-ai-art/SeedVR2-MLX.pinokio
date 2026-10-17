@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SeedVR2-7B MLX Image Upscaler</title>
-  <link rel="stylesheet" href="style.css?v=20">
+  <link rel="stylesheet" href="style.css?v=21">
 </head>
 <body>
   <header id="hero">
@@ -19,6 +19,10 @@
         <h2>Model</h2>
         <select id="model-select" class="input"></select>
         <button id="load-btn" class="btn secondary">⬇️ Load / Switch Model</button>
+        <div id="model-progress" class="progress" style="display:none">
+          <div class="progress-bar" id="model-progress-fill"></div>
+          <span class="progress-label" id="model-progress-text">Preparing…</span>
+        </div>
         <p id="model-status" class="status">Select a model, then click <b>Load Model</b>.</p>
       </section>
 
@@ -42,6 +46,7 @@
           </div>
           <div id="dropzone-thumbs" class="dz-thumbs" style="display:none"></div>
         </div>
+        <p id="input-info" class="status" style="display:none"></p>
       </section>
 
       <section class="group">
@@ -128,7 +133,15 @@
       </div>
 
       <div id="tab-result" class="tab-content" style="display:none">
-        <img id="output-img" class="output-img" alt="Result">
+        <div class="zoom-bar">
+          <span class="zoom-label" id="res-zoom-level">100%</span>
+          <button type="button" class="btn icon" onclick="resetResultZoom()" title="Reset zoom">↺</button>
+        </div>
+        <div id="result-zoom-clip" class="zoom-clip">
+          <div id="result-zoom" class="zoom-clip-inner">
+            <img id="output-img" class="output-img" alt="Result">
+          </div>
+        </div>
         <a id="download-link" class="btn secondary" download>⬇️ Download PNG</a>
       </div>
 
@@ -173,6 +186,6 @@
     </section>
   </main>
 
-  <script src="app.js?v=21"></script>
+  <script src="app.js?v=22"></script>
 </body>
 </html>

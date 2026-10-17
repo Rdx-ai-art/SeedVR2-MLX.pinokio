@@ -164,9 +164,10 @@ Assume the server is running at `http://127.0.0.1:7860` (adjust the port).
 |---|---|---|---|
 | `/api/models` | GET | — | model list with download/load status |
 | `/api/models/load` | POST | form: `slug` | `{"status": "ready", "label": ...}` |
+| `/api/models/progress` | GET | — | live download/load progress: `{"phase": null\|"download"\|"load", "bytes_done", "bytes_total", "files_done", "files_total"}` |
 | `/api/system` | GET | — | `ram_gb`, current + auto `mem_limit_gb`, `mode` |
 | `/api/memlimit` | POST | JSON: `{"gb": 12}` | `{"mem_limit_gb": 12}` |
-| `/api/upscale` | POST | multipart (below) | `filename`, `width`, `height`, `elapsed`, before/after/download URLs |
+| `/api/upscale` | POST | multipart (below) | `filename`, `in_width`, `in_height`, `width`, `height`, `elapsed`, before/after/download URLs |
 | `/api/download/{filename}` | GET | — | the file (from `outputs/` or `uploads/`) |
 | `/api/download_all` | POST | JSON: `{"files": ["a.png", ...]}` | a `.zip` of the given `outputs/` files |
 | `/api/outputs` | GET | — | `size_bytes` + `count` of the outputs folder |
