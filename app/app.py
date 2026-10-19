@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import zipfile
 from pathlib import Path
 from queue import Queue
@@ -23,17 +24,14 @@ from typing import Any, Callable, Optional
 import huggingface_hub as hf
 import mlx.core as mx
 from fastapi import Body, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from PIL import Image
 from tqdm import tqdm
 
 # mflux's __init__.py chain eagerly imports torch, transformers, etc. (for its
 # PyTorch backend). We only use the MLX path, so inject permissive stubs for all
-# PyTorch-backend-only deps. Attribute access returns dummy objects (satisfies
-# annotations, class inheritance); actual *calls* raise a clear error.
-import types
-
+# PyTorch-backend-only deps.
 class _StubAttr:
     def __init__(self, module: str, name: str):
         self._module = module
@@ -64,10 +62,10 @@ from seedvr2_mlx import SeedVR2MLX
 # Model registry
 # --------------------------------------------------------------------------- #
 MODELS = {
-    "SeedVR2-7B-mlx":           {"repo": "benc0/SeedVR2-7B-mlx",            "label": "SeedVR2-7B (fp16)"},
-    "SeedVR2-7B-mlx-int8":      {"repo": "benc0/SeedVR2-7B-mlx-int8",       "label": "SeedVR2-7B (int8) · recommended"},
-    "SeedVR2-7B-sharp-mlx":     {"repo": "benc0/SeedVR2-7B-sharp-mlx",      "label": "SeedVR2-7B Sharp (fp16)"},
-    "SeedVR2-7B-sharp-mlx-int8":{"repo": "benc0/SeedVR2-7B-sharp-mlx-int8", "label": "SeedVR2-7B Sharp (int8)"},
+    "SeedVR2-7B-mlx":            {"repo": "benc0/SeedVR2-7B-mlx",            "label": "SeedVR2-7B (fp16)"},
+    "SeedVR2-7B-mlx-int8":       {"repo": "benc0/SeedVR2-7B-mlx-int8",       "label": "SeedVR2-7B (int8) · recommended"},
+    "SeedVR2-7B-sharp-mlx":      {"repo": "benc0/SeedVR2-7B-sharp-mlx",      "label": "SeedVR2-7B Sharp (fp16)"},
+    "SeedVR2-7B-sharp-mlx-int8": {"repo": "benc0/SeedVR2-7B-sharp-mlx-int8", "label": "SeedVR2-7B Sharp (int8)"},
 }
 DEFAULT_MODEL = "SeedVR2-7B-mlx-int8"
 
@@ -101,12 +99,7 @@ def _total_ram_gb() -> float:
 
 
 def _auto_mem_limit_gb(model: Optional[str] = None) -> int:
-    """50% of system RAM, capped at 24 GB.
-
-    The floor depends on model precision: 16 GB for fp16 (weights are
-    ~14 GB) and 10 GB for int8 (weights are ~7.5 GB). Override with the
-    SEEDVR2_MEM_LIMIT_GB env var (e.g. 12) for testing.
-    """
+    """50% of system RAM, capped at 24 GB."""
     override = os.environ.get("SEEDVR2_MEM_LIMIT_GB")
     if override:
         return max(1, int(override))
@@ -114,26 +107,18 @@ def _auto_mem_limit_gb(model: Optional[str] = None) -> int:
     return max(floor, min(int(_total_ram_gb() * 0.5), 24))
 
 
-# Current Metal memory limit, in GB. The MLX worker thread applies it at
-# startup; /api/memlimit switches it to manual. "mode" tracks whether the
-# value is auto (re-derived per model on load) or user-set.
 _mem_limit = {"gb": _auto_mem_limit_gb(), "mode": "auto"}
 
 # --------------------------------------------------------------------------- #
 # Dedicated MLX thread
 # --------------------------------------------------------------------------- #
-# MLX streams are thread-local. Gradio's worker pool caused "no Stream in current
-# thread" errors. We solve this definitively: ALL MLX work runs on one known thread
-# that we initialize at startup. The async event loop stays free for serving the UI.
-
 _mlx_work: Queue[Callable] = Queue()
 _mlx_done: Queue[tuple] = Queue()
 
 
 def _mlx_thread_main():
     """Runs forever on a single thread. All MLX ops are serialized here."""
-    mx.eval(mx.array([0.0]))  # force Metal stream creation on THIS thread
-    # Set the memory limit ON this thread's stream (it's per-stream, not global).
+    mx.eval(mx.array([0.0]))
     limit = _mem_limit["gb"]
     mx.set_memory_limit(limit * 1024**3)
     print(f"Metal memory limit: {limit} GB")
@@ -167,35 +152,167 @@ _model_state: dict[str, Any] = {"ref": None, "slug": None, "status": "unloaded"}
 _output_counter = 0
 
 # --------------------------------------------------------------------------- #
-# Model download progress (mirrored from huggingface_hub's tqdm bars)
+# Model download progress (mirrored from huggingface_hub + live disk delta)
 # --------------------------------------------------------------------------- #
-# hf.snapshot_download(tqdm_class=_HFTqdm) instantiates _HFTqdm for its
-# aggregate bars: "Reconstructing …" (bytes written to disk) and
-# "Fetching N files" (files finished). We mirror those counters into
-# _download_progress, which the UI polls via /api/models/progress to render
-# a live download bar. Terminal rendering is unchanged: _HFTqdm is a plain
-# tqdm subclass that forwards every call to tqdm.
 _download_lock = threading.Lock()
-_download_progress: dict[str, Any] = {
-    "phase": None,        # None | "download" | "load"
-    "slug": None,
-    "bytes_done": 0,
-    "bytes_total": 0,
-    "files_done": 0,
-    "files_total": 0,
-}
+_download_progress: dict[str, Any] = {}  # keyed by model slug (download phase only)
+
+_speed_window: list[tuple[float, int]] = []
+
+# Module-level global (NOT threading.local) so the download thread running _run
+# can read the slug in _mirror_bar.  Set before run_in_executor, cleared after.
+_current_download_slug = None
 
 
-def _mirror_bar(bar: "tqdm") -> None:
+# --------------------------------------------------------------------------- #
+# Background model download manager
+# Downloads run in a thread-pool executor so they never block the request
+# loop and never touch the _model_state (the currently-loaded model stays
+# loaded and usable while another model downloads in the background).
+# --------------------------------------------------------------------------- #
+_download_managers: dict[str, object] = {}
+
+
+def _start_background_download(slug: str, repo_id: str, loop) -> None:
+    """Start a background download for `slug`. The download persists in the
+    model cache directory (see `MODELS_DIR`) and huggingface_hub will resume
+    it automatically if it is interrupted or the app is quit mid-download."""
+
+    global _current_download_slug  # module-level global so _mirror_bar sees it
+
+    def _run():
+        d = MODELS_DIR / slug
+        d.mkdir(parents=True, exist_ok=True)
+
+        # Fetch metadata so the progress bar knows the total size.
+        try:
+            info = hf.HfApi().model_info(repo_id, files_metadata=True)
+            siblings = [
+                s for s in (info.siblings or [])
+                if not s.rfilename.endswith(".md")
+            ]
+            total_bytes = sum((s.size or 0) for s in siblings)
+            with _download_lock:
+                _download_progress.setdefault(slug, {
+                    "phase": "download",
+                    "slug": slug,
+                    "bytes_done": 0,
+                    "bytes_total": 0,
+                    "files_done": 0,
+                    "files_total": 0,
+                    "speed_bps": 0,
+                })
+                if total_bytes > 0:
+                    _download_progress[slug]["bytes_total"] = total_bytes
+                if siblings:
+                    _download_progress[slug]["files_total"] = len(siblings)
+        except Exception:
+            # Still start the download even if we can't fetch metadata.
+            with _download_lock:
+                _download_progress.setdefault(slug, {
+                    "phase": "download",
+                    "slug": slug,
+                    "bytes_done": 0,
+                    "bytes_total": 0,
+                    "files_done": 0,
+                    "files_total": 0,
+                    "speed_bps": 0,
+                })
+
+        import huggingface_hub.utils as hf_utils
+        orig_tqdm = getattr(hf_utils, "tqdm", None)
+        hf_utils.tqdm = _HFTqdm
+        try:
+            hf.snapshot_download(
+                repo_id,
+                local_dir=str(d),
+                ignore_patterns=["*.md"],
+                tqdm_class=_HFTqdm,  # type: ignore[arg-type]
+            )
+        finally:
+            if orig_tqdm is not None:
+                hf_utils.tqdm = orig_tqdm
+
+        # Download finished (or failed).  Keep the entry in _download_progress
+        # so the UI can show "ready" — the load phase is tracked separately.
+        if model_is_downloaded(slug):
+            with _download_lock:
+                _download_managers.pop(slug, None)
+
+    _current_download_slug = slug  # set BEFORE run_in_executor so the download
+    # thread sees the right slug in _mirror_bar (it may start before this line
+    # returns)
+    future = loop.run_in_executor(None, _run)
+    _download_managers[slug] = future
+
+
+def _update_speed(now_bytes: int) -> int:
+    """Compute rolling 3-second download speed in bytes/sec (call inside _download_lock)."""
+    now = time.time()
+    _speed_window.append((now, now_bytes))
+    cutoff = now - 3.0
+    while len(_speed_window) > 2 and _speed_window[0][0] < cutoff:
+        _speed_window.pop(0)
+    if len(_speed_window) >= 2:
+        dt = _speed_window[-1][0] - _speed_window[0][0]
+        db = _speed_window[-1][1] - _speed_window[0][1]
+        if dt > 0.1 and db >= 0:
+            return int(db / dt)
+    return _download_progress.get("speed_bps", 0)
+
+
+def _dir_bytes(path: Path) -> int:
+    """Sum all file sizes inside `path` (including .cache temp files during download)."""
+    if not path.exists():
+        return 0
+    total = 0
+    try:
+        for p in path.rglob("*"):
+            if p.is_file():
+                try:
+                    total += p.stat().st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
+def _mirror_bar(bar: "tqdm", delta: int = 0) -> None:
     """Copy a huggingface_hub progress bar's counters into _download_progress."""
+    slug = _current_download_slug
+    if not slug:
+        return
+    desc = (getattr(bar, "desc", None) or "").strip()
+    unit = (getattr(bar, "unit", None) or "").strip()
+    n = int(getattr(bar, "n", 0) or 0)
+    total = int(getattr(bar, "total", 0) or 0)
+
     with _download_lock:
-        desc = bar.desc or ""
-        if desc.startswith("Reconstructing"):
-            _download_progress["bytes_done"] = int(bar.n)
-            _download_progress["bytes_total"] = int(bar.total or 0)
-        elif desc.startswith("Fetching"):
-            _download_progress["files_done"] = int(bar.n)
-            _download_progress["files_total"] = int(bar.total or 0)
+        entry = _download_progress.get(slug)
+        if entry is None:
+            return
+        if desc.startswith("Fetching"):
+            entry["files_done"] = n
+            if total > 0:
+                entry["files_total"] = total
+        elif desc.startswith("Downloading bytes"):
+            if n > entry["bytes_done"]:
+                entry["bytes_done"] = n
+                entry["speed_bps"] = _update_speed(n)
+        elif desc.startswith("Reconstructing"):
+            if total > entry["bytes_total"]:
+                entry["bytes_total"] = total
+            if n > entry["bytes_done"]:
+                entry["bytes_done"] = n
+                entry["speed_bps"] = _update_speed(n)
+        elif unit in ("B", "iB") or "B" in unit:
+            if delta > 0:
+                new_done = entry["bytes_done"] + int(delta)
+                if entry["bytes_total"] > 0:
+                    new_done = min(new_done, entry["bytes_total"])
+                entry["bytes_done"] = new_done
+                entry["speed_bps"] = _update_speed(new_done)
 
 
 class _HFTqdm(tqdm):
@@ -203,11 +320,16 @@ class _HFTqdm(tqdm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        _mirror_bar(self)
+        _mirror_bar(self, 0)
 
     def update(self, n: Any = 1) -> Any:
         ret = super().update(n)
-        _mirror_bar(self)
+        _mirror_bar(self, int(n or 0))
+        return ret
+
+    def set_description(self, desc=None, refresh=True) -> Any:
+        ret = super().set_description(desc, refresh=refresh)
+        _mirror_bar(self, 0)
         return ret
 
 
@@ -235,7 +357,6 @@ async def add_no_cache(request, call_next):
 async def startup():
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
-    # Uploaded source images are transient — wipe them on every startup.
     for f in UPLOAD_DIR.iterdir():
         if f.is_file():
             f.unlink()
@@ -262,28 +383,67 @@ async def list_models():
 async def model_download_progress():
     """Live model download/load progress, polled by the UI for its progress bar.
 
-    phase: None (idle) | "download" (bytes/files counters advancing) |
-    "load" (weights -> MLX, indeterminate).
+    ``_download_progress`` is keyed by model slug, so a download for one model
+    is never clobbered when the user loads a different model.  The UI shows the
+    entry for the currently selected model, or whichever download is still
+    running in the background if the user switched away from it.
     """
     with _download_lock:
-        return dict(_download_progress)
+        progress = dict(_download_progress)
+
+    # Sync live disk bytes for the in-flight download.
+    slug = next((s for s, p in progress.items() if p.get("phase") == "download"), None)
+    if slug:
+        disk_b = _dir_bytes(MODELS_DIR / slug)
+        with _download_lock:
+            entry = _download_progress.get(slug)
+            if entry is not None and disk_b > entry["bytes_done"]:
+                entry["bytes_done"] = disk_b
+                entry["speed_bps"] = _update_speed(disk_b)
+                progress = dict(_download_progress)
+
+    return progress
 
 
 @app.post("/api/models/load")
 async def load_model(slug: str = Form(...)):
-    """Download (if needed) then load a model.
+    """Download (in background) then load a model.
 
-    Download is async I/O (event loop). Only the MLX model construction
-    runs on the dedicated MLX thread.
+    The download phase runs in a thread-pool executor: it never holds
+    _model_lock and never touches _model_state, so the currently-loaded
+    model stays loaded and usable while another model downloads in the
+    background.
     """
     if slug not in MODELS:
         raise HTTPException(400, f"Unknown model: {slug}")
+
+    # ------------------------------------------------------------------ #
+    # Download phase: non-blocking, runs in the background.
+    # ------------------------------------------------------------------ #
+    if not model_is_downloaded(slug):
+        repo_id = MODELS[slug]["repo"]
+        mgr = _download_managers.get(slug)
+        if mgr is not None and not mgr.done():  # type: ignore[union-attr]
+            # Already downloading — just report progress.
+            return {"status": "downloading", "slug": slug}
+        # Download finished (or was never started) — fall through to load.
+
+        # Start a new background download.
+        loop = asyncio.get_event_loop()
+        _start_background_download(slug, repo_id, loop)
+
+        return {"status": "downloading", "slug": slug, "label": MODELS[slug]["label"]}
+
+    # ------------------------------------------------------------------ #
+    # Load phase: model is already downloaded — load it now (this may
+    # unload the currently-loaded model, since the user explicitly asked
+    # to switch to a fully-available model).
+    # ------------------------------------------------------------------ #
 
     with _model_lock:
         if _model_state["slug"] == slug and _model_state["ref"] is not None:
             return {"status": "ready", "label": MODELS[slug]["label"]}
 
-        # Free any previously loaded model.
         if _model_state["ref"] is not None:
             del _model_state["ref"]
             _model_state["ref"] = None
@@ -291,39 +451,11 @@ async def load_model(slug: str = Form(...)):
             await loop.run_in_executor(None, mx.clear_cache)
 
         try:
-            # Download (I/O bound — run in executor, NOT on the MLX thread).
             d = MODELS_DIR / slug
             if not model_is_downloaded(slug):
-                with _download_lock:
-                    _download_progress.update({
-                        "phase": "download", "slug": slug,
-                        "bytes_done": 0, "bytes_total": 0,
-                        "files_done": 0, "files_total": 0,
-                    })
-                d.mkdir(parents=True, exist_ok=True)
-                loop = asyncio.get_event_loop()
-                await loop.run_in_executor(
-                    None,
-                    lambda: hf.snapshot_download(
-                        MODELS[slug]["repo"], local_dir=str(d),
-                        ignore_patterns=["*.md"],
-                        tqdm_class=_HFTqdm,  # type: ignore[arg-type]
-                    ),
-                )
-                with _download_lock:
-                    # Download finished — snap the byte counter to the total.
-                    _download_progress["bytes_done"] = _download_progress["bytes_total"]
+                raise HTTPException(500, "Model files missing. Please re-download.")
 
-            # Loading the weights into MLX (indeterminate phase for the UI).
-            with _download_lock:
-                _download_progress["phase"] = "load"
-                _download_progress["slug"] = slug
-
-            # Load model on the dedicated MLX thread (it respects the active
-            # memory limit, so set the limit BEFORE loading for a clean state).
             def _do_load():
-                # In auto mode, re-derive the limit for THIS model's precision
-                # (fp16 needs a 16 GB floor; int8 can go to 10 GB).
                 if _mem_limit["mode"] == "auto":
                     limit = _auto_mem_limit_gb(slug)
                     mx.set_memory_limit(limit * 1024**3)
@@ -338,11 +470,8 @@ async def load_model(slug: str = Form(...)):
             _model_state["slug"] = slug
             _model_state["status"] = "ready"
         finally:
-            # Reset the progress state no matter how the load ended, so the UI
-            # doesn't get stuck on a stale download/load indicator.
             with _download_lock:
-                _download_progress["phase"] = None
-                _download_progress["slug"] = None
+                _download_managers.pop(slug, None)
 
     return {"status": "ready", "label": MODELS[slug]["label"]}
 
@@ -360,10 +489,7 @@ async def system_info():
 
 @app.post("/api/memlimit")
 async def set_mem_limit(gb: int = Body(..., embed=True)):
-    """Set the Metal memory limit at runtime (applied on the MLX thread).
-
-    Affects new allocations only — best set before loading the model.
-    """
+    """Set the Metal memory limit at runtime (applied on the MLX thread)."""
     gb = max(10, min(gb, 256))
 
     def _do():
@@ -397,25 +523,21 @@ async def upscale(
         raise HTTPException(400, f"Model '{model}' not loaded. Load it first.")
     ref = _model_state["ref"]
 
-    # Save uploaded file (kept for the compare view).
     suffix = Path(file.filename or "upload.png").suffix or ".png"
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     upload_path = UPLOAD_DIR / f"upload_{int(time.time()*1000)}{suffix}"
     content = await file.read()
     upload_path.write_bytes(content)
 
-    # Input dimensions (for the UI status line + output sidecar metadata).
     with Image.open(upload_path) as im:
         in_width, in_height = im.size
 
     try:
-        # Determine resolution.
         if scale_mode == "target":
             resolution = int(target_px)
         else:
             resolution = f"{scale_factor:g}x"
 
-        # Tiling config.
         tiling = None
         if use_tiling:
             ov = int(tile_overlap)
@@ -428,7 +550,6 @@ async def upscale(
                 vae_decode_overlap=ov // 8,
             )
 
-        # Run on the dedicated MLX thread.
         loop = asyncio.get_event_loop()
         t0 = time.time()
 
@@ -446,14 +567,12 @@ async def upscale(
         elapsed = time.time() - t0
         mx.clear_cache()
 
-        # Save output: input_stem_seedvr_seed_runN.png
         _output_counter += 1
         stem = Path(file.filename or "image").stem
         out_path = OUTPUT_DIR / f"{stem}_seedvr_s{int(seed)}_{_output_counter}.png"
         after = result.image.convert("RGB")
         after.save(out_path)
 
-        # Run metadata as a sidecar JSON next to the image (keeps the PNG clean).
         meta = {
             "software": "SeedVR2 MLX",
             "image": out_path.name,
@@ -480,7 +599,6 @@ async def upscale(
         }
         out_path.with_suffix(".json").write_text(json.dumps(meta, indent=2))
 
-        # For the compare view: serve the original upload directly (no extra file).
         before_name = upload_path.name
         return {
             "filename": out_path.name,
@@ -510,10 +628,7 @@ async def download(filename: str):
 
 @app.post("/api/download_all")
 async def download_all(files: list = Body(..., embed=True)):
-    """Zip the given output filenames (from outputs/) into a single download.
-
-    Names are validated to live directly inside outputs/ (no path traversal).
-    """
+    """Zip the given output filenames (from outputs/) into a single download."""
     base = OUTPUT_DIR.resolve()
     buf = io.BytesIO()
     count = 0

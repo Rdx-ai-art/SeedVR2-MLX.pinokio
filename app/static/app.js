@@ -11,6 +11,7 @@ let modelLoaded = false;
 // --- Init ---
 document.addEventListener("DOMContentLoaded", async () => {
   await loadModels();
+  resumeModelProgress();
   setupDropzone();
   setupComparisonSlider();
   setupZoom();
@@ -26,17 +27,30 @@ document.addEventListener("DOMContentLoaded", async () => {
   $("#download-all-btn").addEventListener("click", downloadAll);
   $("#clear-outputs-btn").addEventListener("click", clearOutputs);
   refreshOutputsSize();
+
+  const pasteBtn = $("#paste-btn");
+  if (pasteBtn) pasteBtn.addEventListener("click", pasteFromClipboard);
+  window.addEventListener("paste", handlePasteEvent);
+
+  const randEachEl = $("#random-seed-each");
+  const syncSeedInputState = () => {
+    if (!randEachEl) return;
+    $("#seed").style.opacity = randEachEl.checked ? "0.65" : "1";
+  };
+  if (randEachEl) {
+    randEachEl.addEventListener("change", syncSeedInputState);
+    syncSeedInputState();
+  }
+
   $("#rand-seed").addEventListener("click", () => {
     $("#seed").value = Math.floor(Math.random() * 1000000);
   });
+
   $("#scale-mode").addEventListener("change", (e) => {
     const isFactor = e.target.value === "factor";
     $("#factor-row").style.display = isFactor ? "" : "none";
     $("#target-row").style.display = isFactor ? "none" : "";
   });
-  setupCollapsibles();
-  setupSliderLabels();
-  setupTargetSync();
 });
 
 // --- Tab switching (global, for inline onclick handlers) ---
@@ -45,7 +59,6 @@ function switchTab(tab) {
   document.querySelector(`[data-tab="${tab}"]`).classList.add("active");
   document.querySelectorAll(".tab-content").forEach((c) => c.style.display = "none");
   $(`#tab-${tab}`).style.display = "";
-  // Un-nest any inner hidden elements (e.g., #comparison inside #tab-compare)
   if (tab === "compare") {
     const cmp = $("#comparison");
     if (cmp) cmp.style.display = "";
@@ -53,12 +66,22 @@ function switchTab(tab) {
 }
 
 // --- Models ---
+// Client-side cache of which models are fully downloaded (used so the load
+// dialog can tell "download in background" from "load now" without a round-trip).
+const downloadedModels = new Set();
+
 async function loadModels() {
   try {
     const res = await fetch("/api/models");
     const data = await res.json();
     const select = $("#model-select");
     const prev = select.value;
+    // Cache which models are fully downloaded (used by the load dialog).
+    downloadedModels.clear();
+    for (const m of data.models) {
+      if (m.downloaded) downloadedModels.add(m.slug);
+    }
+
     select.innerHTML = "";
     for (const m of data.models) {
       const opt = document.createElement("option");
@@ -66,8 +89,11 @@ async function loadModels() {
       opt.textContent = m.label + (m.downloaded ? "" : " (not downloaded)") + (m.loaded ? " ✓" : "");
       select.appendChild(opt);
     }
-    // Preserve the user's selection (the options list was just rebuilt).
-    if (prev && [...select.options].some((o) => o.value === prev)) select.value = prev;
+    if (prev && [...select.options].some((o) => o.value === prev)) {
+      select.value = prev;
+    } else if (data.current && [...select.options].some((o) => o.value === data.current)) {
+      select.value = data.current;
+    }
     modelLoaded = data.status === "ready";
     updateUpscaleBtn();
   } catch (e) {
@@ -75,13 +101,22 @@ async function loadModels() {
   }
 }
 
+// Client-side check: is this model fully downloaded? (avoids a round-trip to the
+// server so the load dialog can decide "download in background" vs "load now".)
+function model_is_downloaded_client(slug) {
+  return downloadedModels.has(slug);
+}
+
 // --- Model download / load progress (polled from the server) ---
-// Mirrors the same download the terminal shows; the server gets its numbers
-// from huggingface_hub's own progress bars.
 let modelProgressTimer = null;
+let modelLoadActive = false;
 
 function stopModelProgress() {
-  if (modelProgressTimer) { clearInterval(modelProgressTimer); modelProgressTimer = null; }
+  modelLoadActive = false;
+  if (modelProgressTimer) {
+    clearInterval(modelProgressTimer);
+    modelProgressTimer = null;
+  }
   const bar = $("#model-progress");
   if (bar) bar.style.display = "none";
 }
@@ -91,19 +126,55 @@ function renderModelProgress(p) {
   const fill = $("#model-progress-fill");
   const text = $("#model-progress-text");
   if (!bar || !fill || !text) return;
-  if (p.phase === "download") {
-    bar.classList.remove("indeterminate");
-    if (p.bytes_total > 0) {
-      fill.style.width = Math.min(100, (p.bytes_done / p.bytes_total) * 100).toFixed(1) + "%";
-      text.textContent = `⬇️ ${fmtBytes(p.bytes_done)} / ${fmtBytes(p.bytes_total)} · ${p.files_done}/${p.files_total} files`;
-    } else {
-      fill.style.width = "0%";
-      text.textContent = `⬇️ ${fmtBytes(p.bytes_done)} · ${p.files_done}/${p.files_total} files`;
+
+  // New shape: a map keyed by model slug { slug: {phase, slug, bytes_done, ...} }.
+  // Fall back to the top-level entry for older backends.
+  const isMap = p && typeof p === "object" && !p.phase && Object.keys(p).some(k => p[k] && p[k].phase);
+  let entry = null;
+  if (isMap) {
+    const selectedSlug = $("#model-select").value;
+    entry = p[selectedSlug] || null;
+    // If the selected model isn't in the map, show whichever download is
+    // still running in the background (the user may have switched away from it).
+    if (!entry) {
+      for (const k of Object.keys(p)) {
+        if (p[k] && p[k].phase === "download") { entry = p[k]; break; }
+      }
     }
-  } else if (p.phase === "load" || p.phase === "unknown") {
+  } else {
+    entry = p; // old backend shape: top-level entry
+  }
+
+  // No download entry at all -> the download finished.  Show "ready".
+  if (!entry) {
+    bar.style.display = "flex";
+    bar.classList.remove("indeterminate");
+    fill.style.width = "100%";
+    text.textContent = "✅ Model ready — click Load / Switch Model to switch.";
+    return;
+  }
+
+  bar.style.display = "flex";
+
+  if (entry.phase === "download") {
+    const speedStr = entry.speed_bps > 0 ? ` · ${fmtBytes(entry.speed_bps)}/s` : "";
+    const filesStr = entry.files_total > 0 ? ` · ${entry.files_done}/${entry.files_total} files` : "";
+    if (entry.bytes_total > 0) {
+      bar.classList.remove("indeterminate");
+      const pct = Math.min(100, (entry.bytes_done / entry.bytes_total) * 100);
+      fill.style.width = pct.toFixed(1) + "%";
+      text.textContent = `⬇️ ${pct.toFixed(0)}% · ${fmtBytes(entry.bytes_done)} / ${fmtBytes(entry.bytes_total)}${speedStr}${filesStr}`;
+    } else {
+      bar.classList.add("indeterminate");
+      fill.style.width = "100%";
+      text.textContent = entry.bytes_done > 0
+        ? `⬇️ ${fmtBytes(entry.bytes_done)}${speedStr}${filesStr}`
+        : `⬇️ Preparing download…${filesStr}`;
+    }
+  } else if (entry.phase === "load" || p.phase === "load" || modelLoadActive) {
     bar.classList.add("indeterminate");
     fill.style.width = "100%";
-    text.textContent = p.phase === "load" ? "⏳ Loading model weights…" : "⬇️ Downloading / loading…";
+    text.textContent = p.phase === "load" ? "⏳ Loading model weights into Metal…" : "⬇️ Starting download / load…";
   } else {
     stopModelProgress();
   }
@@ -113,27 +184,116 @@ async function pollModelProgress() {
   try {
     const res = await fetch("/api/models/progress");
     if (res.ok) {
-      renderModelProgress(await res.json());
+      const p = await res.json();
+      renderModelProgress(p);
     } else if (res.status === 404) {
-      // Server predates the progress endpoint — keep a live-looking bar
-      // (indeterminate) instead of a frozen one.
       renderModelProgress({ phase: "unknown" });
     }
   } catch (e) { /* transient — keep polling */ }
 }
 
+async function resumeModelProgress() {
+  try {
+    const res = await fetch("/api/models/progress");
+    if (!res.ok) return;
+    const p = await res.json();
+    // New shape: a map keyed by slug.  Look for any in-flight entry.
+    let active = null;
+    if (p && typeof p === "object" && !p.phase && Object.keys(p).some(k => p[k] && p[k].phase)) {
+      for (const k of Object.keys(p)) {
+        const e = p[k];
+        if (e.phase === "download" || e.phase === "load") { active = e; break; }
+      }
+    } else if (p && p.phase) {
+      active = p; // old backend shape
+    }
+    if (active) {
+      modelLoadActive = true;
+      $("#model-status").textContent = active.phase === "load"
+        ? "⏳ Loading model weights into Metal…"
+        : "⬇️ Downloading / loading…";
+      $("#load-btn").disabled = true;
+      $("#upscale-btn").disabled = true;
+      $("#model-progress").style.display = "flex";
+      renderModelProgress(p);
+      modelProgressTimer = setInterval(pollModelProgress, 500);
+    }
+  } catch (e) { /* server not ready — ignore */ }
+}
+
 async function loadModel() {
   const slug = $("#model-select").value;
   const statusEl = $("#model-status");
-  statusEl.textContent = "⬇️ Downloading / loading…";
-  statusEl.className = "status";
-  $("#load-btn").disabled = true;
-  $("#upscale-btn").disabled = true;
+  const loadBtn = $("#load-btn");
+  const upscaleBtn = $("#upscale-btn");
 
-  // Live progress bar while the model downloads / loads.
-  $("#model-progress").style.display = "flex";
-  pollModelProgress();
-  modelProgressTimer = setInterval(pollModelProgress, 1000);
+  loadBtn.disabled = true;
+
+  // --- Download phase (non-blocking, fire-and-forget) ---
+  // If the model isn't downloaded yet, kick off the background download and
+  // return immediately. The UI stays responsive: the currently-loaded model
+  // stays loaded and the user can generate right away. The progress bar
+  // keeps polling /api/models/progress until the download finishes.
+  if (!model_is_downloaded_client(slug)) {
+    modelLoadActive = true;
+    const bar = $("#model-progress");
+    if (bar) {
+      bar.style.display = "flex";
+      bar.classList.add("indeterminate");
+      $("#model-progress-fill").style.width = "100%";
+      $("#model-progress-text").textContent = "⬇️ Connecting to Hugging Face…";
+    }
+    if (modelProgressTimer) clearInterval(modelProgressTimer);
+    modelProgressTimer = setInterval(pollModelProgress, 500);
+
+    try {
+      const form = new FormData();
+      form.append("slug", slug);
+      const res = await fetch("/api/models/load", { method: "POST", body: form });
+      if (!res.ok) throw new Error(await res.text());
+      const data = await res.json();
+
+      if (data.status === "downloading") {
+        // Download started in background — return immediately, UI stays live.
+        statusEl.textContent = `⬇️ Downloading ${data.label || slug}…`;
+        // Re-enable controls right away (generation continues with the
+        // currently-loaded model while the download runs in the background).
+        loadBtn.disabled = false;
+        updateUpscaleBtn();
+        return; // <-- fire-and-forget; load phase runs when download finishes
+      }
+      // If the server returned something else (e.g. already downloaded),
+      // fall through to the load phase below.
+    } catch (e) {
+      statusEl.textContent = `❌ ${e.message}`;
+      statusEl.className = "status";
+      modelLoadActive = false;
+      stopModelProgress();
+      loadBtn.disabled = false;
+      updateUpscaleBtn();
+      return;
+    }
+  }
+
+  // --- Load phase (blocking — unloads the current model) ---
+  // Runs here when the model is already downloaded, or after the background
+  // download finishes and the user switches to the newly-available model.
+  modelLoadActive = true;
+  await doModelLoad(slug, statusEl, loadBtn, upscaleBtn);
+}
+
+// Shared load-phase logic (used by loadModel after a download, and by the
+// "Load" button when switching to an already-downloaded model).
+async function doModelLoad(slug, statusEl, loadBtn, upscaleBtn) {
+  const finish = (ok, msg) => {
+    statusEl.textContent = msg;
+    statusEl.className = ok ? "status ok" : "status";
+    modelLoaded = ok;
+    modelLoadActive = false;
+    stopModelProgress();
+    loadBtn.disabled = false;
+    updateUpscaleBtn();
+  };
 
   try {
     const form = new FormData();
@@ -141,17 +301,10 @@ async function loadModel() {
     const res = await fetch("/api/models/load", { method: "POST", body: form });
     if (!res.ok) throw new Error(await res.text());
     const data = await res.json();
-    statusEl.textContent = `✅ Model ready: ${data.label}`;
-    statusEl.className = "status ok";
-    modelLoaded = true;
-    await loadModels(); // refresh the ✓ checkmark + downloaded state
+    await loadModels();
+    finish(true, `✅ Model ready: ${data.label}`);
   } catch (e) {
-    statusEl.textContent = `❌ ${e.message}`;
-    statusEl.className = "status";
-  } finally {
-    stopModelProgress();
-    $("#load-btn").disabled = false;
-    updateUpscaleBtn();
+    finish(false, `❌ ${e.message}`);
   }
 }
 
@@ -161,13 +314,12 @@ function setupDropzone() {
   const input = $("#file-input");
 
   dz.addEventListener("click", (e) => {
-    // Ignore clicks on the remove buttons.
     if (e.target.closest(".dz-remove")) return;
     input.click();
   });
   input.addEventListener("change", () => {
     addFiles([...input.files]);
-    input.value = ""; // allow re-selecting the same file
+    input.value = "";
   });
 
   dz.addEventListener("dragover", (e) => { e.preventDefault(); dz.classList.add("dragover"); });
@@ -179,7 +331,6 @@ function setupDropzone() {
   });
 }
 
-// Global for inline onclick handlers.
 function removeFile(i) {
   const item = uploadedFiles[i];
   if (!item) return;
@@ -191,11 +342,68 @@ function removeFile(i) {
 function addFiles(files) {
   for (const f of files) {
     if (!f.type.startsWith("image/")) continue;
-    // Skip duplicates (same name + size).
     if (uploadedFiles.some((x) => x.file.name === f.name && x.file.size === f.size)) continue;
     uploadedFiles.push({ file: f, url: URL.createObjectURL(f) });
   }
   renderThumbs();
+}
+
+// --- Clipboard Paste (Button + Cmd/Ctrl+V) ---
+async function pasteFromClipboard() {
+  const statusEl = $("#input-info");
+  try {
+    if (!navigator.clipboard || !navigator.clipboard.read) {
+      throw new Error("Clipboard API not available. Press ⌘V / Ctrl+V instead.");
+    }
+    const items = await navigator.clipboard.read();
+    const files = [];
+    for (const item of items) {
+      const imgType = item.types.find((t) => t.startsWith("image/"));
+      if (imgType) {
+        const blob = await item.getType(imgType);
+        const ext = imgType.split("/")[1] || "png";
+        const file = new File([blob], `clipboard_${Date.now()}.${ext}`, { type: imgType });
+        files.push(file);
+      }
+    }
+    if (!files.length) {
+      if (statusEl) {
+        statusEl.textContent = "⚠️ No image found in clipboard.";
+        statusEl.style.display = "";
+      }
+      return;
+    }
+    addFiles(files);
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = `⚠️ Paste failed (${err.message || "permission denied"}) — try pressing ⌘V / Ctrl+V.`;
+      statusEl.style.display = "";
+    }
+  }
+}
+
+function handlePasteEvent(e) {
+  if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
+  const cd = e.clipboardData;
+  if (!cd) return;
+
+  const files = [];
+  for (const item of cd.items || []) {
+    if (item.type.startsWith("image/")) {
+      const f = item.getAsFile();
+      if (f) {
+        const ext = item.type.split("/")[1] || "png";
+        const namedFile = f.name && f.name !== "image.png"
+          ? f
+          : new File([f], `clipboard_${Date.now()}.${ext}`, { type: f.type });
+        files.push(namedFile);
+      }
+    }
+  }
+  if (files.length) {
+    e.preventDefault();
+    addFiles(files);
+  }
 }
 
 function renderThumbs() {
@@ -216,8 +424,6 @@ function renderThumbs() {
   updateUpscaleBtn();
 }
 
-// Global for the inline onload handlers — caption each thumbnail with its
-// true pixel dimensions once it has decoded.
 function thumbDims(img) {
   if (!img.naturalWidth) return;
   const cap = img.parentElement && img.parentElement.querySelector(".dz-dims");
@@ -225,8 +431,6 @@ function thumbDims(img) {
   updateInputInfo();
 }
 
-// One line under the dropzone: the input image size (single image) or the
-// batch total (multiple).
 function updateInputInfo() {
   const el = $("#input-info");
   if (!el) return;
@@ -249,20 +453,13 @@ function updateUpscaleBtn() {
   btn.textContent = n > 1 ? `🚀 Upscale (${n})` : "🚀 Upscale";
 }
 
-// --- Zoom/pan controller (shared by the Compare and Result tabs) ---
-// `wrapper` is the element that receives the scale/pan transform; `rectEl`
-// is a stable, untransformed element whose layout box defines the viewport.
-// The transform is `scale(s) translate(pan)` about the viewport center, so
-// a screen delta maps to a pan delta divided by s, and zooming about a
-// cursor point keeps the image point under it fixed.
+// --- Zoom/pan controller ---
 function makeZoom(wrapper, rectEl, onApply) {
   const st = { level: 1, x: 0, y: 0 };
 
   function clamp() {
     const rect = rectEl.getBoundingClientRect();
     if (!rect || rect.width === 0) return;
-    // At zoom s the image extends (1 - 1/s)·w/2 px past each edge — the
-    // pan can move at most that far before a gap would show.
     const mx = ((1 - 1 / st.level) * rect.width) / 2;
     const my = ((1 - 1 / st.level) * rect.height) / 2;
     st.x = Math.max(-mx, Math.min(mx, st.x));
@@ -307,12 +504,6 @@ function makeZoom(wrapper, rectEl, onApply) {
   };
 }
 
-// --- Comparison slider + zoom (integrated) ---
-// The handle lives inside #cmp-zoom, which is the element that gets the zoom
-// transform, so the clip edge, handle line, and images always stay aligned.
-// Not zoomed: dragging anywhere moves the slider.
-// Zoomed: dragging the image pans, dragging the ⇔ handle moves the slider,
-// a plain click places the slider.
 let cmpZoom = null;
 let resZoom = null;
 let sliderDragging = false;
@@ -327,15 +518,10 @@ function cmpRect() {
   return cmp ? cmp.getBoundingClientRect() : null;
 }
 
-function applyZoom() {
-  if (cmpZoom) cmpZoom.apply();
-}
-
 function resetZoom() {
   if (cmpZoom) cmpZoom.reset();
 }
 
-// Map a cursor screen-X back through the zoom/pan transform into image space.
 function setSliderFromClientX(clientX) {
   if (!cmpZoom) return;
   const rect = cmpRect();
@@ -369,7 +555,6 @@ function beginDrag(clientX, clientY, target) {
 
 function endDrag(clientX, clientY) {
   if (panDragging && cmpZoom && cmpZoom.level > 1) {
-    // A plain click (no drag) places the slider under the cursor.
     if (Math.hypot(clientX - panStartX, clientY - panStartY) < 5) {
       setSliderFromClientX(clientX);
     }
@@ -411,13 +596,11 @@ function setupZoom() {
   if (!cmp) return;
 
   cmpZoom = makeZoom($("#cmp-zoom"), cmp, (s) => {
-    // Counter-scale the knob so it stays a constant size on screen.
     const knob = $("#cmp-knob");
     if (knob) knob.style.transform = `translate(-50%, -50%) scale(${1 / s})`;
     $("#zoom-level").textContent = `${Math.round(s * 100)}%`;
   });
 
-  // Wheel zoom (centered on the cursor) + double-click to reset.
   cmp.addEventListener("wheel", (e) => {
     e.preventDefault();
     cmpZoom.zoomAt(e.clientX, e.clientY, e.deltaY > 0 ? -0.25 : 0.25);
@@ -425,7 +608,6 @@ function setupZoom() {
   cmp.addEventListener("dblclick", () => cmpZoom.reset());
 }
 
-// --- Result tab zoom (same controller as Compare) ---
 function setupResultZoom() {
   const clip = $("#result-zoom-clip");
   if (!clip) return;
@@ -440,7 +622,6 @@ function setupResultZoom() {
   }, { passive: false });
   clip.addEventListener("dblclick", () => resZoom.reset());
 
-  // Drag to pan when zoomed (mouse + touch).
   let dragging = false, lastX = 0, lastY = 0;
   clip.addEventListener("mousedown", (e) => {
     if (resZoom.level <= 1) return;
@@ -475,18 +656,15 @@ function setupResultZoom() {
   window.addEventListener("touchend", () => { dragging = false; });
 }
 
-// Global for the inline onclick handler in the result zoom bar.
 function resetResultZoom() {
   if (resZoom) resZoom.reset();
 }
 
-// --- Collapsibles (global, for inline onclick) ---
 function toggleCollapse(el) {
   el.closest(".collapsible").classList.toggle("open");
 }
 function setupCollapsibles() { /* handled by inline onclick */ }
 
-// --- Slider value labels ---
 function setupSliderLabels() {
   const bindings = [
     ["#scale-factor", "#factor-val", (v) => `${parseFloat(v).toFixed(1)}`],
@@ -504,7 +682,6 @@ function setupSliderLabels() {
   }
 }
 
-// --- Memory limit (Metal) ---
 async function setupMemLimit() {
   const sel = $("#mem-limit");
   const ramInfo = $("#ram-info");
@@ -521,7 +698,6 @@ async function setupMemLimit() {
 
   ramInfo.textContent = `System RAM: ${info.ram_gb} GB`;
 
-  // Candidate limits, filtered to what this machine can actually spare.
   const autoGb = info.auto_mem_limit_gb;
   const candidates = [10, 12, 16, 20, 24, 32, 48, 64, 80, 96];
   const maxRam = Math.ceil(info.ram_gb);
@@ -531,7 +707,6 @@ async function setupMemLimit() {
     options = [...options, info.mem_limit_gb].sort((a, b) => a - b);
   }
 
-  // "Auto" is the default; concrete options below it.
   const isAuto = info.mode === "auto";
   sel.innerHTML =
     `<option value="auto"${isAuto ? " selected" : ""}>Auto — ${autoGb} GB</option>` +
@@ -563,10 +738,9 @@ async function setupMemLimit() {
   });
 }
 
-// --- Range fill: keep the macOS-style filled track in sync with the value ---
 function setupRangeFill() {
   document.querySelectorAll('input[type="range"]').forEach((r) => {
-    if (r.id === "cmp-range") return; // invisible compare slider
+    if (r.id === "cmp-range") return;
     const update = () => {
       const min = parseFloat(r.min || 0);
       const max = parseFloat(r.max || 100);
@@ -577,7 +751,6 @@ function setupRangeFill() {
   });
 }
 
-// --- Target size: sync slider ↔ number input ---
 function setupTargetSync() {
   const slider = $("#target-px");
   const num = $("#target-px-num");
@@ -591,6 +764,7 @@ function setupTargetSync() {
     const v = Math.max(64, Math.min(16384, parseInt(num.value) || 512));
     slider.value = Math.min(8192, Math.max(512, v));
     label.textContent = `${v} px`;
+    slider.dispatchEvent(new Event("input"));
   });
   num.addEventListener("change", () => {
     num.value = Math.max(64, Math.min(16384, parseInt(num.value) || 512));
@@ -598,8 +772,6 @@ function setupTargetSync() {
 }
 
 // --- Upscale (batch) ---
-// Runs every queued file through /api/upscale SEQUENTIALLY — the MLX worker
-// thread serializes GPU work anyway, so parallel requests would only pile up.
 async function doUpscale() {
   if (!uploadedFiles.length || batching) return;
 
@@ -612,7 +784,6 @@ async function doUpscale() {
   const progressText = $("#progress-text");
   const statusEl = $("#result-status");
 
-  // Snapshot the settings once, so every run in the batch is identical.
   const cfg = {
     scale: $("#scale-mode").value === "factor"
       ? `${parseFloat($("#scale-factor").value)}×`
@@ -623,11 +794,6 @@ async function doUpscale() {
   progress.style.display = "flex";
   progressFill.style.width = "0%";
 
-  // Dynamic fill: linear, driven by the best time estimate available —
-  // the previous run's actual elapsed, scaled by pixel count (inference
-  // time is deterministic per resolution/model/tiling). The fill is
-  // capped at 98% of the band until the response actually arrives, so a
-  // bad estimate can never make the bar look finished early.
   let fillPct = 0;
   let fillRaf = null;
   let filling = false;
@@ -654,7 +820,6 @@ async function doUpscale() {
     progressFill.style.width = fillPct + "%";
   };
 
-  // Input pixel count from the already-decoded dropzone thumbnail.
   const itemPx = (i) => {
     const el = $("#dropzone-thumbs").children[i]?.querySelector("img");
     return el && el.naturalWidth ? el.naturalWidth * el.naturalHeight : 0;
@@ -662,7 +827,7 @@ async function doUpscale() {
 
   let ok = 0, fail = 0, lastError = null, lastData = null;
   let prevElapsed = null, prevInPx = 0;
-  const DEFAULT_EST = 90; // seconds, used for the first item only
+  const DEFAULT_EST = 90;
 
   for (let i = 0; i < items.length; i++) {
     const f = items[i].file;
@@ -672,19 +837,31 @@ async function doUpscale() {
     const est = prevElapsed
       ? (px && prevInPx ? Math.min(600, Math.max(5, prevElapsed * (px / prevInPx))) : prevElapsed)
       : DEFAULT_EST;
-    progressText.textContent = `Processing ${i + 1}/${items.length}: ${f.name}`;
+
+    if ($("#random-seed-each")?.checked) {
+      $("#seed").value = Math.floor(Math.random() * 1000000);
+    }
+    const currentSeed = parseInt($("#seed").value, 10) || 42;
+
+    progressText.textContent = `Processing ${i + 1}/${items.length}: ${f.name} (seed ${currentSeed})`;
     statusEl.textContent = `⏳ ${i + 1}/${items.length} — ${f.name}`;
     startFill(bandStart, bandEnd, est);
+
     try {
-      const data = await upscaleOne(f);
+      const data = await upscaleOne(f, currentSeed);
       ok++;
       lastData = data;
       prevElapsed = data.elapsed;
       prevInPx = px;
-      library.unshift({ ...data, sourceName: f.name, scale: cfg.scale, model: cfg.model });
+      library.unshift({
+        ...data,
+        seed: currentSeed,
+        sourceName: f.name,
+        scale: cfg.scale,
+        model: cfg.model,
+      });
       renderLibrary();
       showResult(data);
-      // First result: surface the Result pane so progress is visible live.
       if (ok === 1) switchTab("result");
     } catch (e) {
       fail++;
@@ -703,7 +880,7 @@ async function doUpscale() {
         : "";
       statusEl.textContent =
         (items.length > 1 ? `✅ ${ok}/${items.length} done — ` : "✅ ") +
-        `${dims}${lastData.width}×${lastData.height} · ${lastData.elapsed}s → ${lastData.filename}` +
+        `${dims}${lastData.elapsed}s · seed ${$("#seed").value} → ${lastData.filename}` +
         (items.length > 1 ? " · see Library" : "");
     } else {
       statusEl.textContent = `✅ Done`;
@@ -714,7 +891,6 @@ async function doUpscale() {
     statusEl.className = "status";
   }
 
-  // A batch is best reviewed in the Library; a single run shows its result.
   switchTab(items.length > 1 ? "library" : "result");
 
   batching = false;
@@ -722,8 +898,8 @@ async function doUpscale() {
   setTimeout(() => { progress.style.display = "none"; progressFill.style.width = "0%"; }, 800);
 }
 
-// One file through the API. Throws on failure.
-async function upscaleOne(file) {
+async function upscaleOne(file, seedOverride) {
+  const seedVal = seedOverride != null ? seedOverride : $("#seed").value;
   const form = new FormData();
   form.append("file", file);
   form.append("model", $("#model-select").value);
@@ -732,7 +908,7 @@ async function upscaleOne(file) {
   form.append("target_px", $("#target-px-num").value || $("#target-px").value);
   form.append("softness", $("#softness").value);
   form.append("input_noise", $("#input-noise").value);
-  form.append("seed", $("#seed").value);
+  form.append("seed", seedVal);
   form.append("use_tiling", $("#use-tiling").checked);
   form.append("tile_size", $("#tile-size").value);
   form.append("tile_overlap", $("#tile-overlap").value);
@@ -745,7 +921,6 @@ async function upscaleOne(file) {
   return res.json();
 }
 
-// Fill the Result + Compare views with a run's images.
 function showResult(data) {
   $("#output-img").src = data.after_url;
   $("#download-link").href = data.download_url;
@@ -762,7 +937,6 @@ function showResult(data) {
   $("#result-tabs").style.display = "flex";
 }
 
-// --- Library (session-only: empty on load, fed by every completed run) ---
 function renderLibrary() {
   const grid = $("#library-grid");
   $("#library-empty").style.display = library.length ? "none" : "";
@@ -784,7 +958,7 @@ function renderLibrary() {
         <div class="lib-meta">
           <span class="lib-name">${esc(r.sourceName)}</span>
           <span class="lib-sub">${r.width}×${r.height} · ${r.elapsed}s</span>
-          <span class="lib-sub">${esc(r.scale || "")} · ${esc(r.model || "")}</span>
+          <span class="lib-sub">${esc(r.scale || "")}${r.seed != null ? ` · s:${r.seed}` : ""} · ${esc(r.model || "")}</span>
           <div class="lib-actions" onclick="event.stopPropagation()">
             <button type="button" class="btn icon" onclick="libraryCompare(${i})" title="Compare">↔️</button>
             <a class="btn icon" href="${r.download_url}" download="${esc(r.filename)}" title="Download">⬇️</a>
@@ -792,10 +966,9 @@ function renderLibrary() {
         </div>
       </div>`)
     .join("");
-  refreshOutputsSize(); // keep the on-disk size current after each run/clear
+  refreshOutputsSize();
 }
 
-// Global for inline onclick handlers.
 function libraryCompare(i) {
   const r = library[i];
   if (!r) return;
@@ -812,7 +985,6 @@ function libraryCompare(i) {
   switchTab("compare");
 }
 
-// Zip the whole session's results into one download (server-side).
 async function downloadAll() {
   if (!library.length) return;
   const btn = $("#download-all-btn");
@@ -853,9 +1025,8 @@ async function downloadAll() {
   }
 }
 
-// --- Outputs folder: size readout + full clear (all sessions) ---
 function fmtBytes(n) {
-  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(1) + " GB";
+  if (n >= 1024 ** 3) return (n / 1024 ** 3).toFixed(2) + " GB";
   if (n >= 1024 ** 2) return (n / 1024 ** 2).toFixed(1) + " MB";
   if (n >= 1024) return Math.round(n / 1024) + " KB";
   return n + " B";
@@ -898,7 +1069,7 @@ async function clearOutputs() {
     statusEl.className = "status";
   } finally {
     btn.textContent = orig;
-    refreshOutputsSize(); // re-enables the button if files remain
+    refreshOutputsSize();
   }
 }
 

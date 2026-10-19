@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>SeedVR2-7B MLX Image Upscaler</title>
-  <link rel="stylesheet" href="style.css?v=21">
+  <link rel="stylesheet" href="style.css?v=26" />
 </head>
 <body>
   <header id="hero">
@@ -18,7 +18,7 @@
       <section class="group">
         <h2>Model</h2>
         <select id="model-select" class="input"></select>
-        <button id="load-btn" class="btn secondary">⬇️ Load / Switch Model</button>
+        <button type="button" id="load-btn" class="btn secondary">⬇️ Load / Switch Model</button>
         <div id="model-progress" class="progress" style="display:none">
           <div class="progress-bar" id="model-progress-fill"></div>
           <span class="progress-label" id="model-progress-text">Preparing…</span>
@@ -42,17 +42,18 @@
           <input type="file" id="file-input" accept="image/*" multiple style="display:none">
           <div class="dropzone-inner" id="dropzone-hint">
             <span class="dz-icon">🖼️</span>
-            <span>Drop images or click to browse</span>
+            <span>Drop images, click to browse, or ⌘V</span>
           </div>
           <div id="dropzone-thumbs" class="dz-thumbs" style="display:none"></div>
         </div>
+        <button type="button" id="paste-btn" class="btn secondary full">📋 Paste from Clipboard</button>
         <p id="input-info" class="status" style="display:none"></p>
       </section>
 
       <section class="group">
         <h2>Settings</h2>
         <div class="row">
-          <label class="field">
+          <label class="field grow">
             <span>Output size</span>
             <select id="scale-mode" class="input">
               <option value="factor" selected>Scale factor</option>
@@ -92,8 +93,11 @@
             <span>Seed</span>
             <input type="number" id="seed" class="input" min="0" max="999999" value="42">
           </label>
-	   <button id="rand-seed" class="btn icon" title="Random seed">🎲</button>
+          <button type="button" id="rand-seed" class="btn icon" title="Roll random seed now">🎲</button>
         </div>
+        <label class="check">
+          <input type="checkbox" id="random-seed-each" checked> Always use a new random seed
+        </label>
       </section>
 
       <section class="group collapsible">
@@ -119,7 +123,7 @@
         </div>
       </section>
 
-      <button id="upscale-btn" class="btn primary full" disabled>🚀 Upscale</button>
+      <button type="button" id="upscale-btn" class="btn primary full" disabled>🚀 Upscale</button>
     </aside>
 
     <!-- Right: results -->
@@ -137,6 +141,7 @@
           <span class="zoom-label" id="res-zoom-level">100%</span>
           <button type="button" class="btn icon" onclick="resetResultZoom()" title="Reset zoom">↺</button>
         </div>
+        <p class="hint cmp-controls"><b>Controls</b> — Scroll = zoom · Drag = pan (when zoomed) · Double-click = reset</p>
         <div id="result-zoom-clip" class="zoom-clip">
           <div id="result-zoom" class="zoom-clip-inner">
             <img id="output-img" class="output-img" alt="Result">
@@ -186,6 +191,6 @@
     </section>
   </main>
 
-  <script src="app.js?v=22"></script>
+  <script src="app.js?v=26"></script>
 </body>
 </html>
